@@ -1,0 +1,12 @@
+[submodule "src/DynamixelSDK"]
+	path = src/DynamixelSDK
+	url = https://github.com/ROBOTIS-GIT/DynamixelSDK.git
+[submodule "src/dynamixel_hardware_interface"]
+	path = src/dynamixel_hardware_interface
+	url = https://github.com/ROBOTIS-GIT/dynamixel_hardware_interface.git
+[submodule "src/dynamixel_interfaces"]
+	path = src/dynamixel_interfaces
+	url = https://github.com/ROBOTIS-GIT/dynamixel_interfaces.git
+[submodule "src/open_manipulator"]
+	path = src/open_manipulator
+	url = https://github.com/ROBOTIS-GIT/open_manipulator.git
