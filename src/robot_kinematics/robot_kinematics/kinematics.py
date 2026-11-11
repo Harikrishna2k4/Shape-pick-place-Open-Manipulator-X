@@ -112,16 +112,31 @@ def forward_kinematics_fixed_angle(q1, q2, q3, angle):
 # ============================================================
 
 def check_approach_angle(rotation, angle, tolerance=1e-3):
+    """
+    Check the tool pitch angle independently of joint1.
 
-    expected_x = np.array([
-        np.cos(angle),
-        0.0,
-        -np.sin(angle)
-    ])
+    The first column of the rotation matrix is the tool's local x-axis
+    expressed in the base frame. Since joint1 rotates the arm around base Z,
+    the horizontal direction of this axis changes with joint1. Its horizontal
+    magnitude and vertical component, however, are determined by `angle`.
 
-    actual_x = rotation[:, 0]
+    This check therefore validates:
+        hypot(R[0, 0], R[1, 0]) = cos(angle)
+        R[2, 0]                 = -sin(angle)
+    """
 
-    return np.linalg.norm(actual_x - expected_x) < tolerance
+    actual_x = np.asarray(rotation, dtype=float)[:, 0]
+
+    expected_horizontal = np.cos(angle)
+    expected_vertical = -np.sin(angle)
+
+    actual_horizontal = np.hypot(actual_x[0], actual_x[1])
+    actual_vertical = actual_x[2]
+
+    horizontal_error = abs(actual_horizontal - expected_horizontal)
+    vertical_error = abs(actual_vertical - expected_vertical)
+
+    return max(horizontal_error, vertical_error) < tolerance
 
 
 # ============================================================

@@ -24,6 +24,8 @@ HOUGH_PARAM1 = 100
 HOUGH_PARAM2 = 20
 
 
+
+
 def detect_held_object(frame):
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)

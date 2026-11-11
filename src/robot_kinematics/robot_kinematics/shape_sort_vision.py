@@ -1,0 +1,1426 @@
+#!/usr/bin/env python3
+"""Five-second live shape sorting with robust cardboard-hole triangle fitting.
+
+No user selection is needed anywhere:
+  1) The cardboard task board is found automatically.
+  2) Strict colour + geometry detection runs for 5 s; paired pick/place
+     coordinates are averaged in robot-base XY. Motion (e.g. a hand) restarts
+     the timer.
+  3) Coordinates are FROZEN; the preview stays live. Q/ESC confirms and writes
+     the NPZ/CSV targets. X aborts. (M toggles the colour-mask debug view.)
+
+Shapes are verified with rotation-invariant tests (solidity, fill ratios,
+corner fits, Fourier harmonics of the outline), so hands and clutter are
+rejected. No still image or video is captured or saved.
+"""
+
+from pathlib import Path
+from datetime import datetime
+import os
+import csv
+import sys
+import time
+
+os.environ.setdefault("QT_X11_NO_MITSHM", "1")   # avoids MIT-SHM BadAccess with Qt-based OpenCV
+
+import cv2
+import numpy as np
+
+# ---------------------------- CAMERA -----------------------------
+CAMERA_DEVICE = "/dev/video6"
+IMAGE_WIDTH = 640
+IMAGE_HEIGHT = 480
+FPS = 30
+USE_YUYV = True
+AVERAGING_SECONDS = 5.0
+# No-window mode: set SHAPE_SORT_HEADLESS=1 (also used automatically when DISPLAY is unset).
+# Detection, averaging and file output are identical; targets are accepted automatically.
+HEADLESS = (os.environ.get("SHAPE_SORT_HEADLESS") == "1"
+            or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")))
+MIN_VALID_SAMPLES = 10
+MIN_DETECTION_RATE = 0.70      # fraction of averaging frames with a valid object/hole pair
+MIN_HOLE_DETECTION_RATE = 0.70  # all four fixed cardboard holes must be seen this often
+NO_COLOURED_OBJECTS_EXIT = 4   # valid vision run, but there is nothing to sort
+MAX_POSITION_STD_M = 0.004     # reject targets that jitter more than 4 mm (1 sigma)
+
+# -------------------------- OUTPUT FILES --------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def make_run_dir():
+    configured = os.environ.get("SHAPE_SORT_RUN_DIR")
+    if configured:
+        run_dir = Path(configured).expanduser().resolve()
+    else:
+        stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+        run_dir = SCRIPT_DIR / "shape_sort_runs" / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+# ---------------------- EMBEDDED HOMOGRAPHY -----------------------
+HOMOGRAPHY = np.array([
+    [-9.62326117e-05, -9.58017569e-04,  3.95259251e-01],
+    [-9.93235342e-04,  1.83559771e-04,  5.06539104e-01],
+    [ 7.23290428e-05,  5.17757207e-04,  1.00000000e+00],
+], dtype=np.float64)
+CALIBRATION_WIDTH = 640
+CALIBRATION_HEIGHT = 480
+
+
+# ------------------------- OBJECT CLASSES -------------------------
+SHAPE_ORDER = ("green_circle", "blue_square", "orange_hexagon", "yellow_triangle")
+EXPECTED_GEOMETRY = {
+    "green_circle": "circle",
+    "blue_square": "square",
+    "orange_hexagon": "hexagon",
+    "yellow_triangle": "triangle",
+}
+GEOMETRIES = ("circle", "square", "hexagon", "triangle")
+DISPLAY_COLOURS = {
+    "green_circle": (0, 255, 0),
+    "blue_square": (255, 100, 0),
+    "orange_hexagon": (0, 140, 255),
+    "yellow_triangle": (0, 255, 255),
+}
+
+# Default HSV ranges (OpenCV hue 0..179). Skin sits around H 5-20, S 40-170, so
+# orange/yellow need a high saturation floor. If your blocks are less saturated
+# than this, lower the S minimum of that colour in COLOR_RANGES.
+COLOR_RANGES = {
+    "green_circle":    (np.array([38, 90, 40], np.uint8),  np.array([88, 255, 255], np.uint8)),
+    "blue_square":     (np.array([99, 150, 60], np.uint8), np.array([120, 255, 230], np.uint8)),
+    "orange_hexagon":  (np.array([5, 150, 90], np.uint8),  np.array([19, 255, 255], np.uint8)),
+    "yellow_triangle": (np.array([20, 120, 90], np.uint8), np.array([37, 255, 255], np.uint8)),
+}
+
+MIN_COLOR_AREA_PX = 200.0
+MAX_COLOR_AREA_PX = 18000.0
+MAX_ROI_FRACTION = 0.12
+COLOR_OPEN_KERNEL = 5
+COLOR_CLOSE_KERNEL = 7
+MIN_FILL_OF_MASK = 0.92         # coloured pixels / filled contour area
+MAX_INNER_HUE_STD = 10.0        # tolerate mild illumination gradients on coloured block faces
+SIZE_RATIO_MAX = 3.0            # accepted blocks must be of broadly similar size
+
+# --------------------------- SHAPE TESTS --------------------------
+SOLIDITY_MIN = 0.85             # tolerate mild perspective/shadow irregularity
+TRIANGLE_SOLIDITY_MIN = 0.75
+TRIANGLE_MIN_MATCH_SCORE = 0.18
+CIRCLE_MIN_CIRCULARITY = 0.88
+CIRCLE_MIN_ELLIPSE_RATIO = 0.80
+CIRCLE_MAX_HARMONIC = 0.030     # max amplitude of radial harmonics 3..8
+SQUARE_MIN_RECT_FILL = 0.72
+SQUARE_MIN_ASPECT = 0.65
+SQUARE_MIN_HARMONIC4 = 0.015
+HEX_MIN_HARMONIC6 = 0.020
+HEX_RECT_FILL = (0.64, 0.86)
+HEX_CIRCULARITY = (0.80, 0.975)
+HEX_MAX_SIDE_RATIO = 2.2
+TRI_MIN_HARMONIC3 = 0.08
+TRI_MIN_FILL = 0.58
+
+# ---------------------------- MOTION ------------------------------
+MOTION_PIXEL_DIFF = 30
+MOTION_FRACTION_MAX = 0.006     # fraction of ROI pixels changing => "hand present"
+
+# --------------------------- HOLE RULES ---------------------------
+# Non-coloured shapes are the cut-outs in the tan cardboard strip. The strip is
+# found automatically by its colour; every enclosed opening in it is a hole
+# candidate (whatever colour/brightness shows through), then shape-verified.
+CARDBOARD_BROAD_LO = (4, 30, 90)      # OpenCV HSV, broad tan/brown search
+CARDBOARD_BROAD_HI = (30, 170, 255)
+CARDBOARD_TOL = np.array([9, 45, 65])  # tight range around the measured strip colour
+MIN_CARDBOARD_FRACTION = 0.02          # strip must cover >= 2% of the frame
+# The cardboard strip is in the central-left task area in the current camera
+# setup. Restricting the search to this region prevents table/floor colours
+# outside the task area from becoming a false cardboard component.
+CARDBOARD_SEARCH_X = (0.18, 0.50)       # fractions of frame width
+CARDBOARD_SEARCH_Y = (0.00, 1.00)       # fractions of frame height
+CARDBOARD_RECT_ASPECT = (0.12, 0.62)    # short side / long side of the strip
+CARDBOARD_CENTER_X_RANGE = (0.27, 0.44) # expected strip centre, as frame-width fractions
+MIN_HOLE_AREA_PX = 110.0
+MAX_HOLE_AREA_PX = 16000.0
+HOLE_MORPH_KERNEL = 3
+HOLE_CLOSE_KERNEL = 5
+MIN_HOLE_TO_OBJECT_AREA_RATIO = 0.55
+MAX_HOLE_TO_OBJECT_AREA_RATIO = 2.50
+
+WINDOW_NAME = "Shape sorting - live detection / averaged targets"
+MASK_WINDOW_NAME = "Colour masks (M to toggle)"
+
+
+# ============================ UTILITIES ============================
+def get_homography():
+    H = np.asarray(HOMOGRAPHY, dtype=np.float64)
+    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
+        raise ValueError("Embedded homography must be a finite 3x3 matrix.")
+    if abs(float(np.linalg.det(H))) < 1e-12:
+        raise ValueError("Embedded homography is singular.")
+    return H
+
+
+def open_camera():
+    camera = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+    if not camera.isOpened():
+        camera.release()
+        raise RuntimeError(f"Cannot open camera {CAMERA_DEVICE}.")
+    if USE_YUYV:
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
+    camera.set(cv2.CAP_PROP_FPS, FPS)
+    for _ in range(5):
+        camera.read()
+    return camera
+
+
+def cardboard_mask(hsv, lo, hi):
+    m = cv2.inRange(hsv, lo, hi)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+
+def detect_cardboard(frames, announce=True):
+    """Detect only the task cardboard strip, independently of coloured blocks.
+
+    A colour threshold alone is unsafe in this scene because the table/floor
+    contains similar brown/grey pixels. Candidate contours are therefore
+    searched only in the known central-left cardboard zone and must also have
+    the long, narrow rectangular geometry of the cardboard strip.
+    """
+    if not frames:
+        return None
+
+    h, w = frames[0].shape[:2]
+    x1 = int(round(CARDBOARD_SEARCH_X[0] * w))
+    x2 = int(round(CARDBOARD_SEARCH_X[1] * w))
+    y1 = int(round(CARDBOARD_SEARCH_Y[0] * h))
+    y2 = int(round(CARDBOARD_SEARCH_Y[1] * h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    avg = np.mean(np.stack([f.astype(np.float32) for f in frames]), axis=0).astype(np.uint8)
+    hsv = cv2.cvtColor(cv2.GaussianBlur(avg, (5, 5), 0), cv2.COLOR_BGR2HSV)
+    hsv_roi = hsv[y1:y2, x1:x2]
+
+    # Keep saturation above the near-grey background range. Two close value
+    # ranges accommodate illumination changes without accepting almost every
+    # neutral surface in the image.
+    ranges = [
+        (np.array((3, 28, 65), np.uint8), np.array((32, 190, 245), np.uint8)),
+        (np.array((3, 35, 45), np.uint8), np.array((32, 220, 235), np.uint8)),
+    ]
+    candidates = []
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    for lo_broad, hi_broad in ranges:
+        local_mask = cv2.inRange(hsv_roi, lo_broad, hi_broad)
+        local_mask = cv2.morphologyEx(local_mask, cv2.MORPH_CLOSE, kernel_close)
+        local_mask = cv2.morphologyEx(local_mask, cv2.MORPH_OPEN, kernel_open)
+        contours, _ = cv2.findContours(local_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for local_contour in contours:
+            area = float(cv2.contourArea(local_contour))
+            if area < MIN_CARDBOARD_FRACTION * w * h:
+                continue
+            if area > 0.38 * w * h:
+                continue
+
+            # Convert the candidate back into full-frame coordinates.
+            contour = local_contour.copy()
+            contour[:, 0, 0] += x1
+            contour[:, 0, 1] += y1
+            (rw, rh) = cv2.minAreaRect(contour)[1]
+            long_side = max(float(rw), float(rh), 1.0)
+            short_side = max(min(float(rw), float(rh)), 1.0)
+            aspect = short_side / long_side
+            if not (CARDBOARD_RECT_ASPECT[0] <= aspect <= CARDBOARD_RECT_ASPECT[1]):
+                continue
+
+            hull = cv2.convexHull(contour)
+            hull_area = float(cv2.contourArea(hull))
+            if hull_area <= 1.0:
+                continue
+            solidity = area / hull_area
+            rect_area = max(float(rw) * float(rh), 1.0)
+            rect_fill = area / rect_area
+            approx = cv2.approxPolyDP(contour, 0.035 * cv2.arcLength(contour, True), True)
+            vertices = len(approx)
+
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            centre_x_fraction = (bx + 0.5 * bw) / float(w)
+            # Do not accept similarly coloured floor/table patches at the left
+            # edge. The cardboard strip is expected near the centre-left of
+            # this camera view; the location prior is combined with geometry.
+            if not (CARDBOARD_CENTER_X_RANGE[0] <= centre_x_fraction <= CARDBOARD_CENTER_X_RANGE[1]):
+                continue
+            if bx <= x1 + 2 or bx + bw >= x2 - 2:
+                continue
+            # Perspective, holes and printed markings lower the solidity and
+            # rectangle fill of the real cardboard. Keep these checks tolerant
+            # but still require a long, narrow, roughly rectangular component.
+            if solidity < 0.42 or rect_fill < 0.35 or not (4 <= vertices <= 16):
+                continue
+
+            vertex_score = 1.0 if vertices <= 6 else max(0.55, 1.0 - 0.06 * (vertices - 6))
+            aspect_score = 1.0 - abs(aspect - 0.30)
+            centre_score = 1.0 - abs(centre_x_fraction - 0.35) / 0.10
+            centre_score = max(0.05, centre_score)
+            score = area * solidity * rect_fill * vertex_score * aspect_score * centre_score
+            full_mask = np.zeros((h, w), np.uint8)
+            full_mask[y1:y2, x1:x2] = local_mask
+            candidates.append((score, area, contour, full_mask, solidity,
+                               rect_fill, vertices, aspect))
+
+    if not candidates:
+        if announce:
+            print("[CARDBOARD] NOT FOUND: no long rectangular tan component inside "
+                  f"search zone x={x1}:{x2}, y={y1}:{y2}.", flush=True)
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, area, best, broad, solidity, rect_fill, vertices, aspect = candidates[0]
+
+    component = np.zeros((h, w), np.uint8)
+    cv2.drawContours(component, [best], -1, 255, cv2.FILLED)
+    selected_pixels = (broad > 0) & (component > 0)
+    if np.count_nonzero(selected_pixels) < MIN_CARDBOARD_FRACTION * w * h:
+        if announce:
+            print("[CARDBOARD] Candidate rejected: too few cardboard-coloured pixels.", flush=True)
+        return None
+
+    # Estimate the cardboard colour only from the selected strip, never from
+    # the entire image. Then refine the strip boundary using only pixels close
+    # to this measured colour. This rejects similarly coloured background
+    # regions that contaminated the broad first-pass contour.
+    med = np.median(hsv[selected_pixels], axis=0)
+    tol = np.array([7, 35, 60], dtype=np.float32)
+    lo = np.clip(med.astype(np.float32) - tol, 0, 255).astype(np.uint8)
+    hi = np.clip(med.astype(np.float32) + tol, 0, 255).astype(np.uint8)
+
+    tight = cv2.inRange(hsv, lo, hi)
+    tight[:y1, :] = 0
+    tight[y2:, :] = 0
+    tight[:, :x1] = 0
+    tight[:, x2:] = 0
+    tight = cv2.morphologyEx(
+        tight, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+
+    # The cardboard may be broken into several colour components by its four
+    # cut-outs, shadows and printed markings. Combine only components whose
+    # centres lie in the expected cardboard-strip zone. A floor/table patch
+    # elsewhere in the image is not included in the fitted boundary.
+    n_labels, component_labels, stats, centroids = cv2.connectedComponentsWithStats(
+        tight, connectivity=8)
+    point_groups = []
+    for label in range(1, n_labels):
+        comp_area = int(stats[label, cv2.CC_STAT_AREA])
+        cx, cy = centroids[label]
+        cx_fraction = float(cx) / float(w)
+        if comp_area < 50:
+            continue
+        if not (CARDBOARD_CENTER_X_RANGE[0] <= cx_fraction <= CARDBOARD_CENTER_X_RANGE[1]):
+            continue
+        yy, xx = np.where(component_labels == label)
+        if len(xx):
+            point_groups.append(np.column_stack((xx, yy)).astype(np.float32))
+
+    if not point_groups:
+        if announce:
+            print("[CARDBOARD] Broad candidate found, but no matching cardboard-colour "
+                  "components remained after background rejection.", flush=True)
+        return None
+
+    refined_points = np.concatenate(point_groups, axis=0).reshape(-1, 1, 2)
+    refined_rect = cv2.minAreaRect(refined_points)
+    refined_rw, refined_rh = refined_rect[1]
+    refined_aspect = min(refined_rw, refined_rh) / max(refined_rw, refined_rh, 1.0)
+    refined_cx = float(refined_rect[0][0]) / float(w)
+    if (not (CARDBOARD_RECT_ASPECT[0] <= refined_aspect <= CARDBOARD_RECT_ASPECT[1])
+            or not (CARDBOARD_CENTER_X_RANGE[0] <= refined_cx <= CARDBOARD_CENTER_X_RANGE[1])):
+        if announce:
+            print(f"[CARDBOARD] Refined candidate rejected: centre={refined_cx:.2f}, "
+                  f"aspect={refined_aspect:.2f}.", flush=True)
+        return None
+
+    board_polygon = cv2.boxPoints(refined_rect).astype(np.float32)
+    polygon_centre = np.mean(board_polygon, axis=0)
+    board_polygon = polygon_centre + 0.98 * (board_polygon - polygon_centre)
+    board_polygon_i = np.round(board_polygon).astype(np.int32)
+    board_mask = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(board_mask, board_polygon_i, 255)
+    # Inset the hole-search region from the board edge to ensure that the
+    # outer table/floor can never be considered a hole.
+    hole_search_mask = cv2.erode(
+        board_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)), iterations=1
+    )
+    exclusion_mask = cv2.dilate(board_mask, np.ones((9, 9), np.uint8), 1)
+
+    bx, by, bw, bh = cv2.boundingRect(board_polygon_i.reshape(-1, 1, 2))
+    pad = 3
+    bbox = (max(bx - pad, 0), max(by - pad, 0), min(bx + bw + pad, w), min(by + bh + pad, h))
+    clipped_edges = []
+    if bx <= 1: clipped_edges.append("left")
+    if by <= 1: clipped_edges.append("top")
+    if bx + bw >= w - 1: clipped_edges.append("right")
+    if by + bh >= h - 1: clipped_edges.append("bottom")
+
+    result = {
+        "lo": lo, "hi": hi, "bbox": bbox, "contour": best,
+        "board_polygon": board_polygon_i.reshape(-1, 1, 2),
+        "board_mask": board_mask, "hole_search_mask": hole_search_mask,
+        "mask": exclusion_mask, "clipped_edges": clipped_edges,
+    }
+    if announce:
+        print(f"[CARDBOARD] FOUND task strip only: bbox={bbox}, area={area:.0f}px, "
+              f"aspect={aspect:.2f}, solidity={solidity:.2f}, "
+              f"rectangularity={rect_fill:.2f}, HSV median={med.astype(int).tolist()}",
+              flush=True)
+    return result
+
+
+def mask_to_roi(mask, roi):
+    x1, y1, x2, y2 = roi
+    clipped = np.zeros_like(mask)
+    clipped[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+    return clipped
+
+
+def pixel_to_robot_xy(pixel_xy, H):
+    p = np.asarray(pixel_xy, dtype=np.float32).reshape(1, 1, 2)
+    mapped = cv2.perspectiveTransform(p, H)[0, 0]
+    result = np.asarray(mapped, dtype=np.float64)
+    if result.shape != (2,) or not np.all(np.isfinite(result)):
+        raise ValueError(f"Invalid homography result for pixel point {pixel_xy}.")
+    return result
+
+
+# ============================ GEOMETRY ============================
+def polygon_internal_angles(poly):
+    pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    angles = []
+    for i in range(len(pts)):
+        a = pts[(i - 1) % len(pts)] - pts[i]
+        b = pts[(i + 1) % len(pts)] - pts[i]
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        if denom <= 1e-9:
+            return []
+        angles.append(float(np.degrees(np.arccos(np.clip(np.dot(a, b) / denom, -1, 1)))))
+    return angles
+
+
+def polygon_side_ratio(poly):
+    pts = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    lengths = np.array([np.linalg.norm(pts[(i + 1) % len(pts)] - pts[i]) for i in range(len(pts))])
+    if np.min(lengths) <= 1e-6:
+        return float("inf")
+    return float(np.max(lengths) / np.min(lengths))
+
+
+def fit_polygon(hull, perimeter, n):
+    """Return an n-vertex polygon from the hull if a stable fit exists."""
+    found = []
+    for eps in np.linspace(0.010, 0.080, 36):
+        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
+        if len(approx) == n:
+            found.append(approx.reshape(-1, 2))
+        elif len(approx) < n:
+            break
+    if len(found) < 3:   # must be stable over several tolerance levels
+        return None
+    return found[len(found) // 2]
+
+
+def fit_triangle(hull, perimeter):
+    """Fit a triangle across a wider tolerance range than square/hexagon.
+
+    The cardboard cut-outs have soft edges, perspective distortion and small
+    mask gaps. Their convex hull can still have a stable triangular outline,
+    but the old 0.01-0.08 epsilon window was too narrow for that contour.
+    """
+    found = []
+    for eps in np.linspace(0.025, 0.180, 63):
+        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
+        if len(approx) == 3:
+            found.append(approx.reshape(-1, 2))
+    if len(found) < 4:
+        return None
+    return found[len(found) // 2]
+
+
+def radial_harmonics(contour, center, bins=128):
+    """Amplitudes of the Fourier series of normalised radius vs angle."""
+    pts = contour.reshape(-1, 2).astype(np.float64) - np.asarray(center, dtype=np.float64)
+    ang = np.arctan2(pts[:, 1], pts[:, 0])
+    rad = np.hypot(pts[:, 0], pts[:, 1])
+    order = np.argsort(ang)
+    ang, rad = ang[order], rad[order]
+    grid = np.linspace(-np.pi, np.pi, bins, endpoint=False)
+    prof = np.interp(grid, ang, rad, period=2 * np.pi)
+    mean = float(np.mean(prof))
+    if mean <= 1e-6:
+        return np.zeros(bins // 2 + 1)
+    prof = prof / mean
+    return 2.0 * np.abs(np.fft.rfft(prof)) / bins
+
+
+def _template(n, rot):
+    t = np.array([[100 * np.cos(rot + 2 * np.pi * k / n), 100 * np.sin(rot + 2 * np.pi * k / n)]
+                  for k in range(n)], dtype=np.float32)
+    return t.reshape(-1, 1, 2)
+
+
+TEMPLATES = {
+    "circle": _template(120, 0.0),
+    "square": _template(4, np.pi / 4),
+    "hexagon": _template(6, 0.0),
+    "triangle": _template(3, -np.pi / 2),
+}
+
+
+def contour_metrics(contour):
+    """Rotation-invariant measurements of a filled blob (needs dense contour)."""
+    area = float(cv2.contourArea(contour))
+    if area <= 20.0 or len(contour) < 8:
+        return None
+    hull = cv2.convexHull(contour)
+    hull_area = float(cv2.contourArea(hull))
+    perim = float(cv2.arcLength(hull, True))
+    if hull_area <= 1e-6 or perim <= 1e-6:
+        return None
+    mom = cv2.moments(hull)
+    if abs(mom["m00"]) < 1e-9:
+        return None
+    center = (float(mom["m10"] / mom["m00"]), float(mom["m01"] / mom["m00"]))
+    (rw, rh) = cv2.minAreaRect(hull)[1]
+    long_s, short_s = max(rw, rh, 1e-6), max(min(rw, rh), 1e-6)
+    ellipse_ratio = 0.0
+    if len(hull) >= 5:
+        (_, _), (ea, eb), _ = cv2.fitEllipse(hull)
+        ellipse_ratio = float(min(ea, eb) / max(ea, eb, 1e-6))
+    try:
+        tri_area = float(cv2.minEnclosingTriangle(hull)[0])
+    except cv2.error:
+        tri_area = 0.0
+    return {
+        "area": area, "hull": hull, "hull_area": hull_area, "perimeter": perim,
+        "solidity": area / hull_area,
+        "circularity": float(4 * np.pi * area / (perim * perim)),
+        "rect_fill": float(area / (long_s * short_s)),
+        "aspect": float(short_s / long_s),
+        "ellipse_ratio": ellipse_ratio,
+        "tri_fill": float(area / tri_area) if tri_area > 1e-6 else 0.0,
+        "center": center,
+        "amp": radial_harmonics(contour, center),
+        "bbox": cv2.boundingRect(hull),
+        "polygon": None,
+    }
+
+
+def fit_hole_triangle(metrics):
+    """Recognise a triangular cardboard cut-out from its convex-hull outline.
+
+    The binary missing-cardboard mask can be ragged because reflections,
+    shadows and texture interrupt the cut-out interior. This lowers contour
+    solidity even when the physical opening is visibly triangular. For holes,
+    require a stable 3-corner hull fit and plausible interior angles instead
+    of requiring a high filled-contour solidity/fill ratio.
+    """
+    hull = metrics["hull"]
+    perimeter = metrics["perimeter"]
+    triangle = fit_triangle(hull, perimeter)
+    if triangle is None:
+        return None, float("inf")
+    angles = polygon_internal_angles(triangle)
+    if len(angles) != 3 or min(angles) < 18.0 or max(angles) > 150.0:
+        return None, float("inf")
+    # Score the hull, not the ragged source contour.
+    score = float(cv2.matchShapes(
+        hull, TEMPLATES["triangle"], cv2.CONTOURS_MATCH_I1, 0.0))
+    return triangle, score
+
+
+def shape_fit(contour):
+    """Return (metrics, fits). fits[geometry] = (ok, score, reason); lower score is better."""
+    m = contour_metrics(contour)
+    if m is None:
+        return None, None
+    amp = m["amp"]
+    band = amp[3:9]                                  # harmonics 3..8
+    dom = int(np.argmax(band)) + 3
+    hull, perim = m["hull"], m["perimeter"]
+    sol = m["solidity"]
+    fits = {}
+
+    def verdict(name, checks):
+        failed = [txt for ok, txt in checks if not ok]
+        score = float(cv2.matchShapes(contour, TEMPLATES[name], cv2.CONTOURS_MATCH_I1, 0.0))
+        fits[name] = (not failed, score, failed[0] if failed else "")
+
+    verdict("circle", [
+        (sol >= SOLIDITY_MIN, f"solidity {sol:.2f}"),
+        (m["circularity"] >= CIRCLE_MIN_CIRCULARITY, f"circ {m['circularity']:.2f}"),
+        (m["ellipse_ratio"] >= CIRCLE_MIN_ELLIPSE_RATIO, f"ellipse {m['ellipse_ratio']:.2f}"),
+        (float(np.max(band)) <= CIRCLE_MAX_HARMONIC, f"corners h{dom}={np.max(band):.3f}"),
+    ])
+
+    quad = fit_polygon(hull, perim, 4)
+    qa = polygon_internal_angles(quad) if quad is not None else []
+    verdict("square", [
+        (sol >= SOLIDITY_MIN, f"solidity {sol:.2f}"),
+        (quad is not None and len(qa) == 4, "no stable 4 corners"),
+        (bool(qa) and 65 <= min(qa) and max(qa) <= 115, "corner angles"),
+        (m["rect_fill"] >= SQUARE_MIN_RECT_FILL, f"rect fill {m['rect_fill']:.2f}"),
+        (m["aspect"] >= SQUARE_MIN_ASPECT, f"aspect {m['aspect']:.2f}"),
+        (dom in (4, 5) and amp[4] >= SQUARE_MIN_HARMONIC4, f"h4={amp[4]:.3f} dom={dom}"),
+    ])
+    if quad is not None and fits["square"][0]:
+        m["polygon_square"] = quad
+
+    hexa = fit_polygon(hull, perim, 6)
+    ha = polygon_internal_angles(hexa) if hexa is not None else []
+    verdict("hexagon", [
+        (sol >= SOLIDITY_MIN, f"solidity {sol:.2f}"),
+        (hexa is not None and len(ha) == 6, "no stable 6 corners"),
+        (bool(ha) and 90 <= min(ha) and max(ha) <= 150, "corner angles"),
+        (hexa is not None and polygon_side_ratio(hexa) <= HEX_MAX_SIDE_RATIO, "side ratio"),
+        (HEX_RECT_FILL[0] <= m["rect_fill"] <= HEX_RECT_FILL[1], f"rect fill {m['rect_fill']:.2f}"),
+        (HEX_CIRCULARITY[0] <= m["circularity"] <= HEX_CIRCULARITY[1], f"circ {m['circularity']:.2f}"),
+        (amp[6] >= HEX_MIN_HARMONIC6 and amp[6] >= 0.60 * float(np.max(band)),
+         f"h6={amp[6]:.3f} vs max={np.max(band):.3f}" ),
+    ])
+    if hexa is not None and fits["hexagon"][0]:
+        m["polygon_hexagon"] = hexa
+
+    tri = fit_triangle(hull, perim)
+    ta = polygon_internal_angles(tri) if tri is not None else []
+    triangle_score = float(cv2.matchShapes(
+        contour, TEMPLATES["triangle"], cv2.CONTOURS_MATCH_I1, 0.0))
+    verdict("triangle", [
+        # Hole boundaries can contain small gaps caused by cardboard texture
+        # and lighting. Use the stable convex-hull triangle and match score,
+        # rather than demanding an almost-perfect filled silhouette.
+        (sol >= TRIANGLE_SOLIDITY_MIN, f"solidity {sol:.2f}"),
+        (tri is not None and len(ta) == 3, "no stable 3 corners"),
+        (bool(ta) and 20 <= min(ta) and max(ta) <= 145, "corner angles"),
+        (m["tri_fill"] >= TRI_MIN_FILL, f"tri fill {m['tri_fill']:.2f}"),
+        (triangle_score <= TRIANGLE_MIN_MATCH_SCORE,
+         f"triangle match {triangle_score:.3f}"),
+    ])
+    if tri is not None and fits["triangle"][0]:
+        m["polygon_triangle"] = tri
+    return m, fits
+
+
+# ============================ MOTION GUARD ============================
+def motion_fraction(prev_gray, gray, roi):
+    if prev_gray is None:
+        return 0.0
+    x1, y1, x2, y2 = roi
+    diff = cv2.absdiff(prev_gray[y1:y2, x1:x2], gray[y1:y2, x1:x2])
+    moving = (diff > MOTION_PIXEL_DIFF).astype(np.uint8)
+    moving = cv2.morphologyEx(moving, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return float(np.count_nonzero(moving)) / max(moving.size, 1)
+
+
+# ===================== 3D OBJECT TOP-FACE ESTIMATION =====================
+def fit_top_face_ellipse(contour, upper_fraction=0.62):
+    """Fit the visible circular top face from the upper silhouette arc.
+
+    A cylinder's coloured side wall/base can extend below its circular top.
+    Using the centroid/circularity of the complete silhouette shifts the pick
+    point and often rejects the cylinder.  The upper arc is largely unaffected
+    by that lower extension, so fit an ellipse to only the upper part of the
+    silhouette and use the ellipse centre as the top-face centre.
+
+    Returns (ellipse, centre, projected_area, aspect_ratio, median_residual).
+    """
+    pts = np.asarray(contour, dtype=np.int32).reshape(-1, 2)
+    if len(pts) < 12:
+        return None
+    x, y, w, h = cv2.boundingRect(contour)
+    if w < 8 or h < 8:
+        return None
+    cutoff = y + float(upper_fraction) * h
+    upper = pts[pts[:, 1] <= cutoff]
+    if len(upper) < 12:
+        return None
+    try:
+        ellipse = cv2.fitEllipse(upper.reshape(-1, 1, 2))
+    except cv2.error:
+        return None
+    (cx, cy), (axis_a, axis_b), angle_deg = ellipse
+    major = max(float(axis_a), float(axis_b))
+    minor = min(float(axis_a), float(axis_b))
+    if major <= 1.0 or minor <= 1.0:
+        return None
+    aspect = minor / major
+    # The cap is allowed to look elliptical because the camera is oblique.
+    if aspect < 0.48:
+        return None
+    # Measure how well the upper contour follows the fitted ellipse.
+    theta = np.deg2rad(float(angle_deg))
+    dx = upper[:, 0].astype(np.float64) - float(cx)
+    dy = upper[:, 1].astype(np.float64) - float(cy)
+    xr = dx * np.cos(theta) + dy * np.sin(theta)
+    yr = -dx * np.sin(theta) + dy * np.cos(theta)
+    radial = np.sqrt((xr / max(float(axis_a) / 2.0, 1e-6)) ** 2 +
+                     (yr / max(float(axis_b) / 2.0, 1e-6)) ** 2)
+    residual = float(np.median(np.abs(radial - 1.0)))
+    if residual > 0.16:
+        return None
+    # Reject implausible ellipse centres/axes outside the parent silhouette.
+    if not (x - 0.15 * w <= cx <= x + 1.15 * w and
+            y - 0.20 * h <= cy <= y + 0.85 * h):
+        return None
+    projected_area = float(np.pi * major * minor / 4.0)
+    if projected_area < MIN_COLOR_AREA_PX * 0.45:
+        return None
+    return ellipse, (float(cx), float(cy)), projected_area, aspect, residual
+
+
+def extract_bright_top_face(hsv, raw_mask, contour):
+    """Try to separate a brighter planar top face from a darker 3D side wall.
+
+    This is used for square/hexagon/triangle prisms. It is deliberately
+    conservative: it returns a face contour only when a coherent bright region
+    reaches the top of the object's silhouette and occupies a meaningful area.
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+    if w < 10 or h < 10:
+        return None
+    local_contour = np.asarray(contour, dtype=np.int32).copy()
+    local_contour[:, 0, 0] -= x
+    local_contour[:, 0, 1] -= y
+    filled = np.zeros((h, w), np.uint8)
+    cv2.drawContours(filled, [local_contour], -1, 255, cv2.FILLED)
+    raw_roi = raw_mask[y:y + h, x:x + w]
+    valid = (filled > 0) & (raw_roi > 0)
+    values = hsv[y:y + h, x:x + w, 2][valid]
+    if values.size < 100:
+        return None
+    p10, p90 = np.percentile(values, [10, 90])
+    if p90 - p10 < 16:
+        return None
+    otsu, _ = cv2.threshold(values.reshape(-1, 1), 0, 255,
+                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Keep Otsu from selecting only isolated specular highlights.
+    otsu = max(float(otsu), float(np.percentile(values, 42)))
+    v_roi = hsv[y:y + h, x:x + w, 2]
+    bright = np.zeros((h, w), np.uint8)
+    bright[valid & (v_roi > otsu)] = 255
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    full_area = max(float(cv2.contourArea(contour)), 1.0)
+    options = []
+    for candidate in cnts:
+        a = float(cv2.contourArea(candidate))
+        bx, by, bw, bh = cv2.boundingRect(candidate)
+        # A top face must touch/approach the top of the full object, not a
+        # bright patch halfway down its side wall.
+        if by > max(3, int(0.18 * h)):
+            continue
+        if a < max(90.0, 0.14 * full_area) or a > 0.95 * full_area:
+            continue
+        shifted = candidate.copy()
+        shifted[:, 0, 0] += x
+        shifted[:, 0, 1] += y
+        options.append((a, shifted))
+    if not options:
+        return None
+    options.sort(key=lambda item: item[0], reverse=True)
+    return options[0][1]
+
+
+def fit_top_face_polygon(contour, expected):
+    """Perspective-tolerant polygon fit for the visible cap of a 3D prism."""
+    n_by_shape = {"square": 4, "hexagon": 6, "triangle": 3}
+    n = n_by_shape.get(expected)
+    if n is None:
+        return None, float("inf")
+    hull = cv2.convexHull(contour)
+    perimeter = float(cv2.arcLength(hull, True))
+    if perimeter <= 1e-6:
+        return None, float("inf")
+    found = []
+    for eps in np.linspace(0.012, 0.20, 76):
+        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
+        if len(approx) == n:
+            found.append(approx.reshape(-1, 2))
+    if len(found) < 3:
+        return None, float("inf")
+    poly = found[len(found) // 2]
+    angles = polygon_internal_angles(poly)
+    if len(angles) != n:
+        return None, float("inf")
+    side_ratio = polygon_side_ratio(poly)
+    score = float(cv2.matchShapes(hull, TEMPLATES[expected],
+                                   cv2.CONTOURS_MATCH_I1, 0.0))
+    if expected == "square":
+        valid = min(angles) >= 22 and max(angles) <= 158 and side_ratio <= 5.0 and score <= 0.85
+    elif expected == "hexagon":
+        valid = min(angles) >= 35 and max(angles) <= 165 and side_ratio <= 4.5 and score <= 0.42
+    else:
+        valid = min(angles) >= 12 and max(angles) <= 158 and score <= 0.85
+    return (poly, score) if valid else (None, score)
+
+
+def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
+    """Return a top-face based centre/area when a 3D shape cap can be isolated."""
+    expected = EXPECTED_GEOMETRY[name]
+    if expected == "circle":
+        fitted = fit_top_face_ellipse(contour)
+        if fitted is not None:
+            ellipse, centre, area, aspect, residual = fitted
+            return {
+                "center": centre, "area": area, "contour": None,
+                "ellipse": ellipse, "metrics": full_metrics,
+                "score": residual, "mode": "upper-arc ellipse",
+                "note": f"top ellipse AR={aspect:.2f} residual={residual:.3f}",
+            }
+
+    face_contour = extract_bright_top_face(hsv, raw_mask, contour)
+    if face_contour is not None:
+        face_metrics, face_fits = shape_fit(face_contour)
+        if face_metrics is not None:
+            ok, score, _ = face_fits[expected]
+            polygon = None
+            if not ok and expected in ("square", "hexagon", "triangle"):
+                polygon, polygon_score = fit_top_face_polygon(face_contour, expected)
+                if polygon is not None:
+                    ok, score = True, polygon_score
+                    face_metrics["polygon_" + expected] = polygon
+            if ok:
+                return {
+                    "center": face_metrics["center"],
+                    "area": float(cv2.contourArea(face_contour)),
+                    "contour": face_contour, "ellipse": None,
+                    "metrics": face_metrics, "score": float(score),
+                    "mode": "bright top-face contour",
+                    "note": "top face separated from side wall",
+                }
+    # Flat/2D objects without a visible separate side wall retain the original
+    # whole-contour result. For 3D objects, the top-face path above takes priority.
+    if full_metrics is not None and full_fits[expected][0]:
+        return {
+            "center": full_metrics["center"],
+            "area": float(cv2.contourArea(contour)),
+            "contour": contour, "ellipse": None,
+            "metrics": full_metrics, "score": float(full_fits[expected][1]),
+            "mode": "whole contour fallback",
+            "note": "no separate top face found",
+        }
+    return None
+
+
+# ============================ OBJECT DETECTION ============================
+def find_coloured_objects(frame, roi, exclude_mask=None):
+    blurred = cv2.GaussianBlur(frame, (3, 3), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    objects = {}
+    debug = {name: [] for name in SHAPE_ORDER}
+    object_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    raw_masks = np.zeros(frame.shape, dtype=np.uint8)
+    any_colour = np.zeros(frame.shape[:2], dtype=np.uint8)
+    open_k = np.ones((COLOR_OPEN_KERNEL, COLOR_OPEN_KERNEL), np.uint8)
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (COLOR_CLOSE_KERNEL,) * 2)
+    roi_area = max((roi[2] - roi[0]) * (roi[3] - roi[1]), 1)
+    max_area = min(MAX_COLOR_AREA_PX, MAX_ROI_FRACTION * roi_area)
+
+    for name in SHAPE_ORDER:
+        lower, upper = COLOR_RANGES[name]
+        raw = cv2.inRange(hsv, lower, upper)
+        raw = mask_to_roi(raw, roi)
+        if exclude_mask is not None:
+            raw[exclude_mask > 0] = 0
+        raw_masks[raw > 0] = DISPLAY_COLOURS[name]
+        mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, open_k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+        any_colour |= mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        accepted = []
+
+        for contour in contours:
+            full_area = float(cv2.contourArea(contour))
+            if full_area < MIN_COLOR_AREA_PX:
+                continue
+            full_metrics, full_fits = shape_fit(contour)
+            entry = {
+                "contour": contour, "area": full_area,
+                "metrics": full_metrics, "geometry": "unknown", "reason": "",
+                "face_contour": None, "face_ellipse": None, "face_mode": "",
+            }
+            debug[name].append(entry)
+            if full_metrics is None:
+                entry["reason"] = "degenerate"
+                continue
+            if full_area > max_area:
+                entry["reason"] = "too large"
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if x <= roi[0] + 2 or y <= roi[1] + 2 or x + w >= roi[2] - 2 or y + h >= roi[3] - 2:
+                entry["reason"] = "touches ROI edge"
+                continue
+
+            # Check colour coverage/hue on the complete silhouette, but use
+            # top-face geometry for classification and the robot pick centre.
+            filled = np.zeros(mask.shape, np.uint8)
+            cv2.drawContours(filled, [contour], -1, 255, cv2.FILLED)
+            fill = float(np.count_nonzero(raw[filled > 0])) / max(np.count_nonzero(filled), 1)
+            if fill < MIN_FILL_OF_MASK:
+                entry["reason"] = f"colour fill {fill:.2f}"
+                continue
+            inner = cv2.erode(filled, np.ones((5, 5), np.uint8))
+            hues = hsv[..., 0][inner > 0].astype(np.float32)
+            if hues.size >= 20 and float(np.std(hues)) > MAX_INNER_HUE_STD:
+                entry["reason"] = f"hue spread {np.std(hues):.1f}"
+                continue
+
+            top = analyse_top_face(name, hsv, raw, contour, full_metrics, full_fits)
+            if top is None:
+                why = full_fits[EXPECTED_GEOMETRY[name]][2]
+                entry["reason"] = f"top face not verified: {why}"
+                continue
+
+            entry["geometry"] = EXPECTED_GEOMETRY[name]
+            entry["reason"] = ""
+            entry["face_contour"] = top["contour"]
+            entry["face_ellipse"] = top["ellipse"]
+            entry["face_mode"] = top["mode"]
+            entry["face_note"] = top["note"]
+            entry["metrics"] = top["metrics"]
+            # score drives best-shape selection; top ellipse residual is the
+            # score for cylinders, shape-match score for polygonal caps.
+            accepted.append({
+                "full_area": full_area, "contour": contour,
+                "center": top["center"], "area": top["area"],
+                "metrics": top["metrics"], "score": float(top["score"]),
+                "entry": entry, "face_contour": top["contour"],
+                "face_ellipse": top["ellipse"], "face_mode": top["mode"],
+            })
+
+        if not accepted:
+            continue
+        accepted.sort(key=lambda item: item["score"])
+        if (len(accepted) > 1 and
+                accepted[1]["full_area"] >= 0.70 * accepted[0]["full_area"]):
+            for item in accepted:
+                item["entry"]["reason"] = "ambiguous (several candidates)"
+            continue
+        best = accepted[0]
+        objects[name] = {
+            "center_px": best["center"],
+            "area_px": best["area"],
+            "contour": best["contour"],             # complete silhouette for exclusion
+            "face_contour": best["face_contour"],
+            "face_ellipse": best["face_ellipse"],
+            "face_mode": best["face_mode"],
+            "metrics": best["metrics"],
+        }
+
+    # Cross-object size sanity is now based on visible top-face areas rather
+    # than the larger silhouette areas that include side walls/extensions.
+    if len(objects) >= 3:
+        med = float(np.median([o["area_px"] for o in objects.values()]))
+        for name in list(objects):
+            ratio = objects[name]["area_px"] / max(med, 1.0)
+            if ratio > SIZE_RATIO_MAX or ratio < 1.0 / SIZE_RATIO_MAX:
+                for e in debug[name]:
+                    if e["contour"] is objects[name]["contour"]:
+                        e["reason"] = "top-face size outlier"
+                del objects[name]
+
+    object_mask |= any_colour
+    for obj in objects.values():
+        cv2.drawContours(object_mask, [obj["contour"]], -1, 255, cv2.FILLED)
+    object_mask = cv2.dilate(object_mask, np.ones((7, 7), np.uint8), 1)
+    return objects, object_mask, debug, raw_masks
+
+
+# ============================ HOLE DETECTION ============================
+def find_holes(frame, strip, roi):
+    """Find cut-outs as non-cardboard regions enclosed by the board footprint.
+
+    This is independent of all coloured-object detections. The clean fitted
+    board rectangle defines the search interior; pixels that do not match the
+    cardboard material colour become hole candidates. Components connected to
+    the inset board boundary are rejected as background leakage.
+    """
+    full_mask = np.zeros(frame.shape[:2], np.uint8)
+    if strip is None:
+        return {}, full_mask, []
+
+    x1, y1, x2, y2 = strip["bbox"]
+    hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
+    material = cardboard_mask(hsv[y1:y2, x1:x2], strip["lo"], strip["hi"])
+    inside = strip["hole_search_mask"][y1:y2, x1:x2]
+    material[inside == 0] = 0
+
+    # The difference between the fitted board interior and the detected tan
+    # material is the cut-out/background mask. Small defects are removed.
+    missing = np.zeros_like(material)
+    missing[(inside > 0) & (material == 0)] = 255
+    missing = cv2.morphologyEx(missing, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    missing = cv2.morphologyEx(missing, cv2.MORPH_CLOSE,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    full_mask[y1:y2, x1:x2] = missing
+
+    contours, _ = cv2.findContours(missing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE,
+                                    offset=(x1, y1))
+    candidates = []
+    max_area = min(MAX_HOLE_AREA_PX, 0.10 * (roi[2] - roi[0]) * (roi[3] - roi[1]))
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < MIN_HOLE_AREA_PX or area > max_area:
+            continue
+        # Contours are generated only from missing material inside the inset
+        # cardboard polygon. Geometry/area tests below reject residual border
+        # gaps and background fragments.
+        metrics, fits = shape_fit(contour)
+        if metrics is None:
+            continue
+
+        # Hole-only fallback: the non-cardboard mask inside a cut-out can be
+        # fragmented by shadows/reflections, lowering raw contour solidity.
+        # The convex hull can still provide a stable, three-corner triangle.
+        # This does not relax coloured-block classification.
+        hole_triangle, hole_triangle_score = fit_hole_triangle(metrics)
+        if hole_triangle is not None and not fits["triangle"][0]:
+            fits["triangle"] = (True, hole_triangle_score, "")
+            metrics["polygon_triangle"] = hole_triangle
+            metrics["hole_triangle_hull_fit"] = True
+
+        passing = [g for g in GEOMETRIES if fits[g][0]]
+        reason = "" if passing else min((fits[g][2] for g in GEOMETRIES), key=len)
+        geometry = min(passing, key=lambda g: fits[g][1]) if passing else "unknown"
+        candidates.append({
+            "center_px": metrics["center"], "area_px": area,
+            "geometry": geometry, "fits": fits, "contour": contour,
+            "metrics": metrics, "ok": bool(passing), "reason": reason,
+        })
+
+    selected = {}
+    for name in SHAPE_ORDER:
+        expected = EXPECTED_GEOMETRY[name]
+        options = [
+            (float(c["fits"][expected][1]), c)
+            for c in candidates if c["ok"] and c["fits"][expected][0]
+        ]
+        options.sort(key=lambda item: item[0])
+        if options:
+            # Refuse to guess when duplicate cut-outs have nearly identical fits.
+            if len(options) > 1 and abs(options[1][0] - options[0][0]) < 0.02:
+                continue
+            selected[name] = options[0][1]
+
+    return selected, full_mask, candidates
+
+
+def hole_geometries(candidates):
+    """Which shapes of cut-out are visible, independent of any block."""
+    return {c["geometry"] for c in candidates if c["ok"]}
+
+
+# ============================ DRAWING ============================
+def draw_cross(image, point, colour, label, radius=10):
+    x, y = int(round(point[0])), int(round(point[1]))
+    cv2.drawMarker(image, (x, y), colour, cv2.MARKER_CROSS, radius, 2)
+    cv2.putText(image, label, (x + 7, y - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 2, cv2.LINE_AA)
+
+
+def draw_overlay(frame, roi, strip, objects, object_debug, holes, hole_candidates,
+                 sample_counts, elapsed, averaged=None, averaging_done=False, motion=0.0):
+    display = frame.copy()
+    fh, fw = frame.shape[:2]
+    search_x1 = int(round(CARDBOARD_SEARCH_X[0] * fw))
+    search_x2 = int(round(CARDBOARD_SEARCH_X[1] * fw))
+    search_y1 = int(round(CARDBOARD_SEARCH_Y[0] * fh))
+    search_y2 = int(round(CARDBOARD_SEARCH_Y[1] * fh))
+    cv2.rectangle(display, (search_x1, search_y1), (search_x2, search_y2),
+                  (255, 180, 0), 1, cv2.LINE_AA)
+    cv2.putText(display, "CARDBOARD SEARCH ZONE", (search_x1 + 3, max(search_y1 + 13, 13)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 180, 0), 1, cv2.LINE_AA)
+    if strip is not None:
+        sx1, sy1, sx2, sy2 = strip["bbox"]
+        cv2.polylines(display, [strip["board_polygon"]], True,
+                      (200, 120, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(display, (sx1, sy1), (sx2, sy2), (200, 120, 255), 1)
+        card_text = "CARDBOARD FOUND - independent detection"
+        if strip.get("clipped_edges"):
+            card_text += " | EDGE CLIPPED: " + ",".join(strip["clipped_edges"])
+        cv2.putText(display, card_text, (max(sx1 + 3, 8), max(sy1 + 14, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 120, 255), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(display, "CARDBOARD NOT DETECTED - check view/lighting",
+                    (8, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 255), 2, cv2.LINE_AA)
+
+    for name in SHAPE_ORDER:
+        colour = DISPLAY_COLOURS[name]
+        for cand in object_debug.get(name, []):
+            accepted = name in objects and cand["contour"] is objects[name]["contour"]
+            metrics = cand["metrics"]
+            if accepted:
+                if cand.get("face_ellipse") is not None:
+                    cv2.ellipse(display, cand["face_ellipse"], colour, 3, cv2.LINE_AA)
+                elif cand.get("face_contour") is not None:
+                    cv2.drawContours(display, [cand["face_contour"]], -1, colour, 3, cv2.LINE_AA)
+                else:
+                    key = "polygon_" + EXPECTED_GEOMETRY[name]
+                    if metrics.get(key) is not None:
+                        poly = np.asarray(metrics[key], np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(display, [poly], True, colour, 3, cv2.LINE_AA)
+                    else:
+                        cv2.drawContours(display, [cand["contour"]], -1, colour, 3)
+                if cand.get("face_mode"):
+                    cx, cy = metrics["center"]
+                    cv2.putText(display, cand.get("face_mode", "top face"),
+                                (int(cx) - 35, int(cy) + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.30, colour, 1, cv2.LINE_AA)
+            else:
+                cv2.drawContours(display, [cand["contour"]], -1, (0, 0, 255), 1)
+                if metrics is not None:
+                    cx, cy = metrics["center"]
+                    cv2.putText(display, f"X {name.split('_')[1]}: {cand['reason']}",
+                                (int(cx) - 20, int(cy)), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.34, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # Thin outlines show every candidate; thicker magenta outlines and crosses
+    # identify the selected centre of each independently detected hole.
+    for cand in hole_candidates:
+        if cand["ok"]:
+            cv2.drawContours(display, [cand["contour"]], -1, (200, 120, 255), 1)
+            cx, cy = cand["center_px"]
+            cv2.putText(display, f"hole candidate: {cand['geometry']}",
+                        (int(cx) - 30, int(cy) + 12), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.32, (200, 120, 255), 1, cv2.LINE_AA)
+        else:
+            cv2.drawContours(display, [cand["contour"]], -1, (0, 0, 255), 1)
+            cx, cy = cand["center_px"]
+            cv2.putText(display, f"X hole: {cand['reason']}",
+                        (int(cx) - 30, int(cy) + 12), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.30, (0, 0, 255), 1, cv2.LINE_AA)
+
+    for name, hole in holes.items():
+        cv2.drawContours(display, [hole["contour"]], -1, (255, 0, 255), 3)
+        draw_cross(display, hole["center_px"], (255, 255, 255), f"HOLE {name}")
+
+    pair_names = [name for name in SHAPE_ORDER if name in objects and name in holes]
+    for name, obj in objects.items():
+        draw_cross(display, obj["center_px"], DISPLAY_COLOURS[name], f"PICK {name}")
+        if name in holes:
+            a = tuple(map(int, np.round(obj["center_px"])))
+            b = tuple(map(int, np.round(holes[name]["center_px"])))
+            cv2.line(display, a, b, DISPLAY_COLOURS[name], 2, cv2.LINE_AA)
+
+    if motion > MOTION_FRACTION_MAX:
+        status, scol = ("MOTION DETECTED - HOLD STILL (timer restarts)" if not averaging_done
+                        else "MOTION IN VIEW (targets stay frozen)"), (0, 0, 255)
+    elif not averaging_done:
+        status, scol = f"AVERAGING {elapsed:.1f}/{AVERAGING_SECONDS:.1f}s", (0, 255, 255)
+    else:
+        status, scol = "AVERAGING FROZEN - LIVE PREVIEW CONTINUES", (0, 255, 255)
+    cv2.putText(display, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, scol, 2, cv2.LINE_AA)
+    cv2.putText(display, "Q/ESC: accept and continue | X: abort | M: colour masks",
+                (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
+    valid_hole_count = sum(1 for c in hole_candidates if c["ok"])
+    cv2.putText(display,
+                f"COLOURED OBJECTS: {len(objects)}/4 | CARDBOARD HOLES: {len(holes)}/4 | HOLE CANDIDATES: {valid_hole_count} | PAIRS: {len(pair_names)}",
+                (8, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (255, 255, 255), 1, cv2.LINE_AA)
+
+    for i, name in enumerate(SHAPE_ORDER):
+        line = (f"{name}: block={'YES' if name in objects else 'no'} "
+                f"hole={'YES' if name in holes else 'MISSING'} "
+                f"paired samples={sample_counts.get(name, 0)}")
+        if averaged and name in averaged:
+            p, q = averaged[name]["pick_robot"], averaged[name]["place_robot"]
+            line += f" | AVG PICK=({p[0]:.3f},{p[1]:.3f}) PLACE=({q[0]:.3f},{q[1]:.3f})m"
+            draw_cross(display, averaged[name]["pick_pixel"], (0, 0, 255), f"AVG PICK {name}", 14)
+            draw_cross(display, averaged[name]["place_pixel"], (255, 255, 255), f"AVG PLACE {name}", 14)
+        cv2.putText(display, line, (8, 80 + 18 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.31, DISPLAY_COLOURS[name], 1, cv2.LINE_AA)
+    return display
+
+
+# ============================ AVERAGING / OUTPUT ============================
+def robust_mean(points):
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2 or len(arr) == 0:
+        raise ValueError("No coordinate samples to average.")
+    median = np.median(arr, axis=0)
+    abs_dev = np.abs(arr - median)
+    mad = np.median(abs_dev, axis=0)
+    limit = np.maximum(3.5 * 1.4826 * mad, np.array([0.002, 0.002]))
+    keep = np.all(abs_dev <= limit, axis=1)
+    if int(np.count_nonzero(keep)) < MIN_VALID_SAMPLES:
+        keep = np.ones(len(arr), dtype=bool)
+    kept = arr[keep]
+    return np.mean(kept, axis=0), int(len(kept)), float(np.max(np.std(kept, axis=0)))
+
+
+def write_targets(paths, labels, targets, pick_pixels, place_pixels, sample_counts):
+    targets_file, targets_csv = paths
+    np.savez_compressed(
+        targets_file,
+        targets=np.asarray(targets, dtype=np.float64),
+        labels=np.asarray(labels),
+        pick_pixels=np.asarray(pick_pixels, dtype=np.float64),
+        place_pixels=np.asarray(place_pixels, dtype=np.float64),
+        sample_counts=np.asarray(sample_counts, dtype=np.int32),
+        averaging_seconds=np.float64(AVERAGING_SECONDS),
+        image_width=np.int32(IMAGE_WIDTH),
+        image_height=np.int32(IMAGE_HEIGHT),
+    )
+    with targets_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["shape", "paired_samples", "pick_pixel_x", "pick_pixel_y",
+                         "pick_robot_x_m", "pick_robot_y_m", "place_pixel_x", "place_pixel_y",
+                         "place_robot_x_m", "place_robot_y_m"])
+        for i, name in enumerate(labels):
+            writer.writerow([name, sample_counts[i], *pick_pixels[i], *targets[i, 0],
+                             *place_pixels[i], *targets[i, 1]])
+
+
+def _close_windows():
+    if HEADLESS:
+        return
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
+
+
+def new_sample_store():
+    return {name: {"pick_robot": [], "place_robot": [], "pick_pixel": [], "place_pixel": []}
+            for name in SHAPE_ORDER}
+
+
+def main():
+    print("Starting 5-second shape sorting vision...", flush=True)
+    print("Rule: all four cardboard holes are mandatory; coloured blocks are optional (0-4).", flush=True)
+    print(f"DISPLAY={os.environ.get('DISPLAY', '<not set>')}  headless={HEADLESS}", flush=True)
+    run_dir = make_run_dir()
+    paths = (
+        Path(os.environ.get("SHAPE_SORT_TARGETS_FILE", run_dir / "shape_sort_targets.npz")
+             ).expanduser().resolve(),
+        run_dir / "shape_sort_targets.csv",
+    )
+    print(f"Run folder: {run_dir}", flush=True)
+    H = get_homography()
+    camera = open_camera()
+    try:
+        ok, first_frame = camera.read()
+        if not ok or first_frame is None:
+            raise RuntimeError("Could not read initial camera frame.")
+        fh, fw = first_frame.shape[:2]
+        print(f"Camera frame: {fw}x{fh}", flush=True)
+        if (fw, fh) != (CALIBRATION_WIDTH, CALIBRATION_HEIGHT):
+            raise RuntimeError(f"Camera frame {fw}x{fh} does not match homography resolution "
+                               f"{CALIBRATION_WIDTH}x{CALIBRATION_HEIGHT}.")
+        warm = [first_frame] + [camera.read()[1] for _ in range(9)]
+        warm = [f for f in warm if f is not None]
+        roi = (3, 3, fw - 3, fh - 3)
+        strip = detect_cardboard(warm)
+        if strip is None:
+            print("[WARN] Cardboard not found at startup; the detector will retry on live frames.", flush=True)
+        elif strip.get("clipped_edges"):
+            print("[WARN] Cardboard boundary touches the camera image edge. Check whether all four cut-outs are fully in frame.", flush=True)
+        print("[CARDBOARD] Detection runs independently of coloured objects and object-hole pairing.", flush=True)
+        print("Keep the board and any coloured blocks stationary during the 5-second average.", flush=True)
+
+        data = new_sample_store()
+        seen_block = {n: 0 for n in SHAPE_ORDER}
+        seen_hole = {n: 0 for n in SHAPE_ORDER}
+        hole_pixel_samples = {n: [] for n in SHAPE_ORDER}
+        start = time.monotonic()
+        frames_seen = 0
+        averaging_done = aborted = False
+        show_masks = False
+        averaged = {}
+        last_counts = {name: 0 for name in SHAPE_ORDER}
+        labels, targets, pick_pixels, place_pixels, sample_counts = [], [], [], [], []
+        prev_gray = None
+        motion = 0.0
+        frame_index = 0
+        hole_validation_ok = False
+        missing_holes = list(SHAPE_ORDER)
+        no_coloured_shapes = False
+
+        while True:
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                raise RuntimeError("Camera frame capture failed.")
+            frame_index += 1
+            gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (7, 7), 0)
+            motion = motion_fraction(prev_gray, gray, roi)
+            prev_gray = gray
+
+            # Re-detect the cardboard every five frames. If the board moves or
+            # the startup view was poor, its boundary and hole ROI are updated.
+            if frame_index % 5 == 0 or strip is None:
+                # Never keep a stale board footprint when the current frame
+                # no longer supports a valid cardboard detection.
+                strip = detect_cardboard([frame], announce=False)
+
+            objects, object_mask, object_debug, raw_masks = find_coloured_objects(
+                frame, roi, None if strip is None else strip["mask"])
+            holes, hole_mask, hole_candidates = find_holes(frame, strip, roi)
+
+            if not averaging_done:
+                if motion > MOTION_FRACTION_MAX:
+                    data = new_sample_store()
+                    seen_block = {n: 0 for n in SHAPE_ORDER}
+                    seen_hole = {n: 0 for n in SHAPE_ORDER}
+                    hole_pixel_samples = {n: [] for n in SHAPE_ORDER}
+                    frames_seen = 0
+                    start = time.monotonic()
+                else:
+                    frames_seen += 1
+                    for name in SHAPE_ORDER:
+                        seen_block[name] += int(name in objects)
+                        seen_hole[name] += int(name in holes)
+                        if name in holes:
+                            hole_pixel_samples[name].append(np.asarray(holes[name]["center_px"], float))
+                        # Only create a pick/place pair when both matching shapes exist.
+                        if name in objects and name in holes:
+                            pp = objects[name]["center_px"]
+                            hp = holes[name]["center_px"]
+                            data[name]["pick_pixel"].append(np.asarray(pp, float))
+                            data[name]["place_pixel"].append(np.asarray(hp, float))
+                            data[name]["pick_robot"].append(pixel_to_robot_xy(pp, H))
+                            data[name]["place_robot"].append(pixel_to_robot_xy(hp, H))
+                last_counts = {n: len(data[n]["pick_robot"]) for n in SHAPE_ORDER}
+                elapsed = time.monotonic() - start
+
+                if elapsed >= AVERAGING_SECONDS and frames_seen >= MIN_VALID_SAMPLES:
+                    averaging_done = True
+                    hole_rates = {n: seen_hole[n] / max(frames_seen, 1) for n in SHAPE_ORDER}
+                    missing_holes = [n for n in SHAPE_ORDER
+                                     if hole_rates[n] < MIN_HOLE_DETECTION_RATE]
+                    hole_validation_ok = not missing_holes
+                    print("\nFIVE-SECOND AVERAGING COMPLETE. Coordinates are now frozen.", flush=True)
+                    print("INDEPENDENT CARDBOARD-HOLE CHECK:", flush=True)
+                    for name in SHAPE_ORDER:
+                        centre_samples = hole_pixel_samples[name]
+                        if centre_samples:
+                            centre = np.mean(np.vstack(centre_samples), axis=0)
+                            print(f"  {name}: detected {100 * hole_rates[name]:.0f}% of frames; "
+                                  f"mean centre pixel=({centre[0]:.1f}, {centre[1]:.1f})", flush=True)
+                        else:
+                            print(f"  {name}: NOT DETECTED", flush=True)
+                    if missing_holes:
+                        print("[ERROR] All four cardboard holes are required. Missing/unstable: "
+                              + ", ".join(missing_holes), flush=True)
+                        print("No controller targets will be written. Reposition the board so all four "
+                              "hole boundaries are fully inside the camera frame.", flush=True)
+
+                    no_coloured_shapes = sum(seen_block.values()) == 0
+                    for name in SHAPE_ORDER:
+                        count = len(data[name]["pick_robot"])
+                        rate = count / max(frames_seen, 1)
+                        if count < MIN_VALID_SAMPLES or rate < MIN_DETECTION_RATE:
+                            if seen_block[name] > 0:
+                                print(f"[SKIP] {name}: coloured block was seen in "
+                                      f"{100 * seen_block[name] / max(frames_seen, 1):.0f}% of frames, "
+                                      f"but a stable matching pair was available in {100 * rate:.0f}%.", flush=True)
+                            continue
+                        pick_mean, used_pick, std_pick = robust_mean(data[name]["pick_robot"])
+                        place_mean, used_place, std_place = robust_mean(data[name]["place_robot"])
+                        if max(std_pick, std_place) > MAX_POSITION_STD_M:
+                            print(f"[SKIP] {name}: unstable position "
+                                  f"(std {1000 * max(std_pick, std_place):.1f} mm).", flush=True)
+                            continue
+                        if min(used_pick, used_place) < MIN_VALID_SAMPLES:
+                            print(f"[SKIP] {name}: too few stable coordinate samples.", flush=True)
+                            continue
+                        if np.linalg.norm(pick_mean - place_mean) < 0.005:
+                            print(f"[SKIP] {name}: pick/place centres are less than 5 mm apart.", flush=True)
+                            continue
+                        pick_px = np.mean(np.vstack(data[name]["pick_pixel"]), axis=0)
+                        place_px = np.mean(np.vstack(data[name]["place_pixel"]), axis=0)
+                        labels.append(name)
+                        targets.append([pick_mean, place_mean])
+                        pick_pixels.append(pick_px)
+                        place_pixels.append(place_px)
+                        sample_counts.append(min(used_pick, used_place))
+                        averaged[name] = {"pick_robot": pick_mean, "place_robot": place_mean,
+                                          "pick_pixel": pick_px, "place_pixel": place_px}
+
+                    if labels:
+                        print("MAPPED COLOURED OBJECTS:", flush=True)
+                        for name in labels:
+                            print(f"  {name}: PICK={averaged[name]['pick_robot'].round(5)} "
+                                  f"PLACE={averaged[name]['place_robot'].round(5)} m", flush=True)
+                    elif no_coloured_shapes:
+                        print("No coloured shapes were present during averaging. This is valid; "
+                              "the four holes were still detected, and there is nothing to sort.", flush=True)
+                    else:
+                        print("No stable coloured-object/cardboard-hole pairs were found.", flush=True)
+
+            if HEADLESS:
+                if averaging_done:
+                    print("Headless mode: accepting averaged result automatically.", flush=True)
+                    break
+                continue
+
+            display = draw_overlay(
+                frame, roi, strip, objects, object_debug, holes, hole_candidates, last_counts,
+                min(time.monotonic() - start, AVERAGING_SECONDS), averaged,
+                averaging_done=averaging_done, motion=motion)
+            cv2.imshow(WINDOW_NAME, display)
+            if show_masks:
+                cv2.imshow(MASK_WINDOW_NAME, raw_masks)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("m"), ord("M")):
+                show_masks = not show_masks
+                if not show_masks:
+                    cv2.destroyWindow(MASK_WINDOW_NAME)
+            if key in (ord("x"), ord("X")):
+                aborted = True
+                print("Vision cancelled by user.", flush=True)
+                break
+            if key in (ord("q"), ord("Q"), 27):
+                if averaging_done:
+                    print("Preview accepted; continuing to target validation.", flush=True)
+                else:
+                    aborted = True
+                    print("Vision cancelled before averaging completed.", flush=True)
+                break
+
+        _close_windows()
+        if aborted or not averaging_done:
+            return 2
+        if not hole_validation_ok:
+            return 1
+        if not labels:
+            if no_coloured_shapes:
+                print("VISION COMPLETE: all four holes were detected, but no coloured objects were present.", flush=True)
+                print("No robot controller will be started.", flush=True)
+                return NO_COLOURED_OBJECTS_EXIT
+            print("VISION ERROR: coloured objects were detected but no stable matching pairs passed validation.", flush=True)
+            return 1
+
+        write_targets(paths, labels, np.asarray(targets, dtype=np.float64),
+                      pick_pixels, place_pixels, sample_counts)
+        print(f"\nSaved controller targets: {paths[0]}", flush=True)
+        print(f"Saved coordinate CSV: {paths[1]}", flush=True)
+        print(f"Target array shape: ({len(labels)}, 2, 2) — only available coloured objects.", flush=True)
+        print("No still image or video files were captured or saved.", flush=True)
+        return 0
+    finally:
+        camera.release()
+        _close_windows()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"\nVISION ERROR: {exc}", flush=True)
+        print("Robot controller will NOT be started.", flush=True)
+        raise
