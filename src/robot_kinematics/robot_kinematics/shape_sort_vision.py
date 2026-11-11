@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Five-second live shape sorting with prioritised green-circle detection.
+"""Five-second live shape sorting using a live four-corner ArUco homography.
 
 No user selection is needed anywhere:
   1) The cardboard task board is found automatically.
   2) Strict colour + geometry detection runs for 5 s; paired pick/place
-     coordinates are averaged in robot-base XY. Motion (e.g. a hand) restarts
+     coordinates are converted to robot-base XY and averaged. Motion (e.g. a hand) restarts
      the timer.
   3) Coordinates are FROZEN; the preview stays live. Q/ESC confirms and writes
      the NPZ/CSV targets. X aborts. (M toggles the colour-mask debug view.)
@@ -58,10 +58,24 @@ def make_run_dir():
     return run_dir
 
 
-# --------------------- EXTERNAL CALIBRATION -----------------------
-# Generated separately by calibration_map.py. Keep both files beside this script.
-CALIBRATION_BOARD_FILE = SCRIPT_DIR / "camera_to_robot_board.npz"
-CALIBRATION_PICK_FILE = SCRIPT_DIR / "camera_to_robot_pick.npz"
+# ---------------- LIVE ARUCO -> ROBOT CALIBRATION ----------------
+# One ArUco marker is detected in every camera frame. Its four OUTER corners
+# are mapped to the four robot-base XY positions measured with TCP + FK.
+ARUCO_DICT_NAME = "DICT_4X4_50"
+TARGET_MARKER_ID = None       # None = use the largest detected marker
+MARKER_SIDE_M = 0.037         # physical outer-edge-to-outer-edge side length (m)
+
+# Corner order MUST match OpenCV's detected ArUco order: TL, TR, BR, BL.
+# These are measured TCP/FK robot base_link coordinates, in metres.
+ROBOT_MARKER_CORNERS = np.array([
+    [0.121, 0.131],  # Top-left
+    [0.117, 0.092],  # Top-right
+    [0.079, 0.084],  # Bottom-right
+    [0.083, 0.120],  # Bottom-left
+], dtype=np.float32)
+
+ARUCO_CORNER_LABELS = ("TL", "TR", "BR", "BL")
+ARUCO_MIN_AREA_PX = 80.0
 
 
 # ------------------------- OBJECT CLASSES -------------------------
@@ -194,42 +208,94 @@ MASK_WINDOW_NAME = "Colour masks (M to toggle)"
 
 
 # ============================ UTILITIES ============================
-def _load_plane_homography(path, expected_plane):
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Missing {expected_plane}-plane calibration: {path}. "
-            f"Run calibration_map.py with CALIBRATION_PLANE={expected_plane} and press S."
+def make_aruco_detector():
+    """Create an OpenCV ArUco detector, supporting old and new OpenCV APIs."""
+    if not hasattr(cv2, "aruco"):
+        raise RuntimeError(
+            "cv2.aruco is unavailable. Install an OpenCV contrib build, e.g. "
+            "python3 -m pip install opencv-contrib-python."
         )
-    with np.load(path, allow_pickle=False) as data:
-        required = {"H", "image_width", "image_height"}
-        missing = required.difference(data.files)
-        if missing:
-            raise ValueError(f"{path.name} is missing fields: {sorted(missing)}")
-        H = np.asarray(data["H"], dtype=np.float64)
-        width = int(data["image_width"])
-        height = int(data["image_height"])
-        plane = str(data["plane_name"].item()) if "plane_name" in data.files else expected_plane
-    if plane != expected_plane:
-        raise ValueError(f"{path.name} is labelled '{plane}', expected '{expected_plane}'.")
+
+    aruco = cv2.aruco
+    if not hasattr(aruco, ARUCO_DICT_NAME):
+        raise RuntimeError(
+            f"ArUco dictionary {ARUCO_DICT_NAME} is not available in this OpenCV build."
+        )
+
+    dictionary = aruco.getPredefinedDictionary(
+        getattr(aruco, ARUCO_DICT_NAME)
+    )
+
+    if hasattr(aruco, "DetectorParameters"):
+        parameters = aruco.DetectorParameters()
+    else:
+        parameters = aruco.DetectorParameters_create()
+
+    if hasattr(aruco, "CORNER_REFINE_SUBPIX"):
+        parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+
+    if hasattr(aruco, "ArucoDetector"):
+        detector = aruco.ArucoDetector(dictionary, parameters)
+    else:
+        detector = None
+
+    return detector, dictionary, parameters
+
+
+def detect_aruco_homography(frame, detector, dictionary, parameters):
+    """Return (H, detected_marker_corners, marker_id) for the current frame.
+
+    H maps camera pixels directly to robot base_link XY in metres. All four
+    measured robot corner coordinates are used; no axis-alignment assumption
+    or external calibration .npz file is used.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if detector is not None:
+        corners, ids, _rejected = detector.detectMarkers(gray)
+    else:
+        corners, ids, _rejected = cv2.aruco.detectMarkers(
+            gray, dictionary, parameters=parameters
+        )
+
+    if ids is None or len(ids) == 0:
+        return None, None, None
+
+    flat_ids = ids.flatten()
+    candidates = [
+        i for i, marker_id in enumerate(flat_ids)
+        if TARGET_MARKER_ID is None or int(marker_id) == TARGET_MARKER_ID
+    ]
+    if not candidates:
+        return None, None, None
+
+    chosen = max(
+        candidates,
+        key=lambda i: cv2.contourArea(
+            corners[i].reshape(4, 2).astype(np.float32)
+        ),
+    )
+
+    image_corners = corners[chosen].reshape(4, 2).astype(np.float32)
+    marker_area = abs(float(cv2.contourArea(image_corners)))
+    if marker_area < ARUCO_MIN_AREA_PX:
+        return None, None, None
+
+    if not np.all(np.isfinite(image_corners)):
+        return None, None, None
+
+    # OpenCV ArUco corner sequence: TL, TR, BR, BL.
+    H = cv2.getPerspectiveTransform(
+        image_corners,
+        ROBOT_MARKER_CORNERS,
+    )
+
     if H.shape != (3, 3) or not np.all(np.isfinite(H)):
-        raise ValueError(f"{path.name}: homography must be a finite 3x3 matrix.")
+        return None, None, None
     if abs(float(np.linalg.det(H))) < 1e-12:
-        raise ValueError(f"{path.name}: homography is singular.")
-    if width <= 0 or height <= 0:
-        raise ValueError(f"{path.name}: image dimensions are invalid.")
-    return H, width, height
+        return None, None, None
 
-
-def get_homographies():
-    """Load the board-plane map for holes and pick-plane map for 3D object tops."""
-    H_board, bw, bh = _load_plane_homography(CALIBRATION_BOARD_FILE, "board")
-    H_pick, pw, ph = _load_plane_homography(CALIBRATION_PICK_FILE, "pick")
-    if (bw, bh) != (pw, ph):
-        raise ValueError(
-            f"Board calibration is {bw}x{bh}, but pick calibration is {pw}x{ph}. "
-            "Both maps must use the same camera resolution."
-        )
-    return H_pick, H_board, bw, bh
+    return H, corners[chosen], int(flat_ids[chosen])
 
 
 def open_camera():
@@ -1310,9 +1376,9 @@ def find_holes(frame, strip, roi):
     # There is exactly one circle, one hexagon, one square and one triangle.
     # The circular cut-out is at one end of the strip. The cut-out immediately
     # adjacent to the circle along the board's long axis is ALWAYS the hexagon.
-    # This positional rule deliberately overrides a square-template pass for
-    # that same hole (the measured hexagon can resemble a square in silhouette).
-    # The remaining two holes are assigned by their own square/triangle fits.
+    # This positional rule overrides strict hexagon contour tests and any
+    # square-template pass for that same hole. The remaining two holes are
+    # assigned by their own square/triangle fits.
     # No candidate can be reused for two shape classes.
 
     selected = {}
@@ -1355,9 +1421,14 @@ def find_holes(frame, strip, roi):
         selected["green_circle"] = circle_candidate
         used_ids.add(id(circle_candidate))
 
-        # 2) The nearest distinct hole along the board axis is hard-coded as
-        # the hexagon. Its hexagon-template score must still be plausible; the
-        # positional rule resolves square-vs-hexagon ambiguity, not bad contours.
+        # 2) The nearest distinct hole along the board's long axis is the
+        # hexagon slot. Here the known physical board layout is the deciding
+        # constraint: the hexagonal cut-out is immediately adjacent to the
+        # circular cut-out. Do NOT require a stable six-corner contour, strict
+        # circularity, or a hexagon-template score. The real opening has soft,
+        # rounded edges and can look almost circular/square in this camera view.
+        # The candidate is already constrained to be a sufficiently large
+        # non-cardboard component enclosed by the fitted cardboard footprint.
         other_candidates = [
             c for c in candidates
             if id(c) not in used_ids and id(c) not in reserved_ids
@@ -1368,38 +1439,32 @@ def find_holes(frame, strip, roi):
         adjacent = other_candidates[0] if other_candidates else None
 
         if adjacent is not None:
-            # The adjacent slot is the hexagon slot by the supplied board layout.
-            # If its contour fails the hexagon gate, leave it missing; never relabel
-            # that slot as a square or triangle.
             reserved_ids.add(id(adjacent))
-            mm = adjacent["metrics"]
-            hex_score = float(adjacent["fits"]["hexagon"][1])
-            hex_signature_ok = (
-                np.isfinite(hex_score)
-                and hex_score <= 0.08
-                and mm["solidity"] >= 0.80
-                and 0.86 <= mm["circularity"] <= 0.975
-                and 0.70 <= mm["rect_fill"] <= 0.93
-                and mm["aspect"] >= 0.90
+            raw_hex_score = float(adjacent["fits"]["hexagon"][1])
+            adjacent["geometry"] = "hexagon"
+            adjacent["ok"] = True
+            adjacent["reason"] = ""
+            adjacent["fits"]["hexagon"] = (
+                True, raw_hex_score,
+                "assigned by fixed board layout: immediately adjacent to circle"
             )
-            if hex_signature_ok:
-                adjacent["geometry"] = "hexagon"
-                adjacent["ok"] = True
-                adjacent["reason"] = ""
-                adjacent["fits"]["hexagon"] = (
-                    True, hex_score, "adjacent-to-circle cardboard layout rule"
-                )
-                adjacent["layout_rule"] = "immediately adjacent to circle = hexagon"
-                adjacent["metrics"]["layout_hexagon_override"] = True
-                selected["orange_hexagon"] = adjacent
-                used_ids.add(id(adjacent))
-            else:
-                adjacent["layout_rule"] = "adjacent-to-circle candidate failed hexagon shape gate"
-                print(
-                    "[HOLE LAYOUT] The hole adjacent to the circle did not pass the "
-                    f"hexagon shape gate (hex score={hex_score:.4f}); hexagon left unassigned.",
-                    flush=True,
-                )
+            adjacent["layout_rule"] = "immediately adjacent to circle = hexagon"
+            adjacent["metrics"]["layout_hexagon_override"] = True
+            adjacent["metrics"]["hexagon_shape_score_before_layout"] = raw_hex_score
+            selected["orange_hexagon"] = adjacent
+            used_ids.add(id(adjacent))
+            print(
+                "[HOLE LAYOUT] Assigned orange_hexagon to the nearest distinct "
+                f"hole next to green_circle (raw shape score={raw_hex_score:.4f}; "
+                "shape gate bypassed by the fixed layout rule).",
+                flush=True,
+            )
+        else:
+            print(
+                "[HOLE LAYOUT] Circle detected, but no second hole candidate was "
+                "available beside it; orange_hexagon remains unassigned.",
+                flush=True,
+            )
 
     # 3) Assign the one remaining square candidate, excluding circle and hexagon.
     square_options = [
@@ -1645,6 +1710,9 @@ def write_targets(paths, labels, targets, pick_pixels, place_pixels, sample_coun
         averaging_seconds=np.float64(AVERAGING_SECONDS),
         image_width=np.int32(IMAGE_WIDTH),
         image_height=np.int32(IMAGE_HEIGHT),
+        aruco_dictionary=np.array(ARUCO_DICT_NAME),
+        aruco_marker_side_m=np.float64(MARKER_SIDE_M),
+        aruco_robot_corners=np.asarray(ROBOT_MARKER_CORNERS, dtype=np.float64),
     )
     with targets_csv.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -1681,11 +1749,26 @@ def main():
         run_dir / "shape_sort_targets.csv",
     )
     print(f"Run folder: {run_dir}", flush=True)
-    H_pick, H_board, calibration_width, calibration_height = get_homographies()
-    print(f"Loaded board-plane calibration: {CALIBRATION_BOARD_FILE}", flush=True)
-    print(f"Loaded object-top calibration: {CALIBRATION_PICK_FILE}", flush=True)
-    print(f"Calibration resolution: {calibration_width}x{calibration_height}", flush=True)
-    print("Object pick pixels use H_pick; cardboard-hole place pixels use H_board.", flush=True)
+    detector, dictionary, aruco_parameters = make_aruco_detector()
+    print(f"ArUco dictionary: {ARUCO_DICT_NAME}; target ID: "
+          f"{TARGET_MARKER_ID if TARGET_MARKER_ID is not None else 'largest detected'}", flush=True)
+    print(f"ArUco outer side length: {MARKER_SIDE_M * 1000:.1f} mm", flush=True)
+    print("Robot marker corners (base_link metres; order TL, TR, BR, BL):", flush=True)
+    for corner_name, corner_xy in zip(ARUCO_CORNER_LABELS, ROBOT_MARKER_CORNERS):
+        print(f"  {corner_name}: X={corner_xy[0]:.5f}, Y={corner_xy[1]:.5f}", flush=True)
+    edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
+    measured_edges_mm = [
+        1000.0 * float(np.linalg.norm(ROBOT_MARKER_CORNERS[a] - ROBOT_MARKER_CORNERS[b]))
+        for a, b in edge_pairs
+    ]
+    print(
+        "Measured robot-coordinate marker edge lengths (mm): "
+        + ", ".join(f"{v:.1f}" for v in measured_edges_mm)
+        + f" (physical side is {MARKER_SIDE_M * 1000:.1f} mm)",
+        flush=True,
+    )
+    print("Object pick pixels AND cardboard-hole place pixels use the live four-corner "
+          "ArUco homography.", flush=True)
     camera = open_camera()
     try:
         ok, first_frame = camera.read()
@@ -1693,11 +1776,6 @@ def main():
             raise RuntimeError("Could not read initial camera frame.")
         fh, fw = first_frame.shape[:2]
         print(f"Camera frame: {fw}x{fh}", flush=True)
-        if (fw, fh) != (calibration_width, calibration_height):
-            raise RuntimeError(
-                f"Camera frame {fw}x{fh} does not match saved calibration resolution "
-                f"{calibration_width}x{calibration_height}. Recalibrate at the current resolution."
-            )
         warm = [first_frame] + [camera.read()[1] for _ in range(9)]
         warm = [f for f in warm if f is not None]
         roi = (3, 3, fw - 3, fh - 3)
@@ -1738,6 +1816,13 @@ def main():
             if not ok or frame is None:
                 raise RuntimeError("Camera frame capture failed.")
             frame_index += 1
+
+            # Detect the ArUco marker in this exact frame and build the live
+            # pixel -> robot XY map from its four measured outer corners.
+            marker_H, marker_corners_cv, marker_id = detect_aruco_homography(
+                frame, detector, dictionary, aruco_parameters
+            )
+
             gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (7, 7), 0)
             motion = motion_fraction(prev_gray, gray, roi)
             prev_gray = gray
@@ -1770,21 +1855,33 @@ def main():
                     hole_pixel_samples = {n: [] for n in SHAPE_ORDER}
                     frames_seen = 0
                     start = time.monotonic()
+                elif marker_H is None:
+                    # Without a detected marker there is no current pixel-to-
+                    # robot transform, so pause coordinate sampling this frame.
+                    pass
                 else:
                     frames_seen += 1
                     for name in SHAPE_ORDER:
                         seen_block[name] += int(name in objects)
                         seen_hole[name] += int(name in holes)
                         if name in holes:
-                            hole_pixel_samples[name].append(np.asarray(holes[name]["center_px"], float))
-                        # Only create a pick/place pair when both matching shapes exist.
+                            hole_pixel_samples[name].append(
+                                np.asarray(holes[name]["center_px"], float)
+                            )
+                        # Only create a pair when the matching block and hole
+                        # exist. Both centres use the same live four-corner
+                        # ArUco homography and become robot base_link XY.
                         if name in objects and name in holes:
                             pp = objects[name]["center_px"]
                             hp = holes[name]["center_px"]
                             data[name]["pick_pixel"].append(np.asarray(pp, float))
                             data[name]["place_pixel"].append(np.asarray(hp, float))
-                            data[name]["pick_robot"].append(pixel_to_robot_xy(pp, H_pick))
-                            data[name]["place_robot"].append(pixel_to_robot_xy(hp, H_board))
+                            data[name]["pick_robot"].append(
+                                pixel_to_robot_xy(pp, marker_H)
+                            )
+                            data[name]["place_robot"].append(
+                                pixel_to_robot_xy(hp, marker_H)
+                            )
                 last_counts = {n: len(data[n]["pick_robot"]) for n in SHAPE_ORDER}
                 elapsed = time.monotonic() - start
 
@@ -1863,6 +1960,40 @@ def main():
                 frame, roi, strip, objects, object_debug, holes, hole_candidates, last_counts,
                 min(time.monotonic() - start, AVERAGING_SECONDS), averaged,
                 averaging_done=averaging_done, motion=motion)
+
+            if marker_H is None:
+                cv2.putText(
+                    display,
+                    "ARUCO NOT DETECTED - coordinate samples paused",
+                    (8, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+                    (0, 0, 255), 2, cv2.LINE_AA
+                )
+            else:
+                cv2.aruco.drawDetectedMarkers(
+                    display,
+                    [marker_corners_cv],
+                    np.array([[marker_id]], dtype=np.int32)
+                )
+                marker_image_corners = marker_corners_cv.reshape(4, 2)
+                for i, (px, py) in enumerate(marker_image_corners):
+                    cv2.circle(
+                        display, (int(round(px)), int(round(py))),
+                        4, (0, 255, 255), -1
+                    )
+                    cv2.putText(
+                        display,
+                        ARUCO_CORNER_LABELS[i],
+                        (int(round(px)) + 4, int(round(py)) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (0, 255, 255), 1, cv2.LINE_AA
+                    )
+                cv2.putText(
+                    display,
+                    f"ARUCO ID {marker_id} | live pixel-to-robot map active",
+                    (8, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+                    (0, 255, 255), 1, cv2.LINE_AA
+                )
+
             cv2.imshow(WINDOW_NAME, display)
             if show_masks:
                 cv2.imshow(MASK_WINDOW_NAME, raw_masks)

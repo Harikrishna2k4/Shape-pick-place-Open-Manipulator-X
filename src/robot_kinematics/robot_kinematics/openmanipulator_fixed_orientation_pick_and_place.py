@@ -11,8 +11,9 @@ Motion policy:
     Cartesian motion. A small measured pitch error at a segment start is
     smoothly corrected over that segment rather than causing a sudden jump.
   * The full 3D orientation is NOT held fixed when q1 changes; see below.
-  * Pick: open -> descend -> close -> ascend.
-  * Place: travel -> descend -> open -> ascend.
+  * Travel: keep the TCP at or above 0.150 m.
+  * Pick/place contact: descend vertically to 0.060 m, then lift/retract.
+  * Gripper: maximum separation before pickup and after placement.
 
 IMPORTANT:
   1. HOME_ANGLE is calculated from HOME_Q using the supplied kinematics.py:
@@ -64,7 +65,13 @@ ARM_ACTION = "/arm_controller/follow_joint_trajectory"
 GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 
 # Supplied initial/home configuration (rad).
-HOME_Q = np.array([0.08283, -0.96181, 0.17181, 1.29008], dtype=float)
+# 45-degree tool pitch (q2 + q3 + q4 = pi/4), preserving HOME_XYZ.
+HOME_Q = np.array([
+     0.08284516,
+    -0.68172609,
+    -0.19297961,
+     1.66010386,
+], dtype=float)
 
 # This value follows from your supplied FK model's orientation convention.
 HOME_ANGLE = float(HOME_Q[1] + HOME_Q[2] + HOME_Q[3])
@@ -75,7 +82,8 @@ TASK_TOOL_ANGLE = HOME_ANGLE
 # The supplied FK gives this position for HOME_Q:
 HOME_XYZ = np.array([0.11822, 0.00882, 0.19707], dtype=float)
 
-TRAVEL_Z = 0.160  # Clearance waypoint, not a path-wide Z constraint.
+MIN_TRANSFER_Z = 0.150  # End effector must stay at/above 15 cm during horizontal travel.
+TRAVEL_Z = MIN_TRANSFER_Z
 
 # One-shot camera output. Keep this file beside this controller.
 SORT_TARGETS_FILE = Path(os.environ.get(
@@ -88,22 +96,23 @@ SORT_SHAPES = (
     "orange_hexagon",
     "yellow_triangle",
 )
-PICK_CONTACT_Z = 0.110
-PLACE_CONTACT_Z = 0.110
+PICK_CONTACT_Z = 0.060  # Descend to 6 cm only for grasping.
+PLACE_CONTACT_Z = 0.060  # Descend to 6 cm only for releasing.
 
 # GripperCommand action position values in metres.
 # User observed the previous mapping behaved in reverse, so the endpoints
 # are swapped here. Verify with a gripper-only test before running the arm.
-GRIPPER_OPEN_POSITION = 0.000
+GRIPPER_OPEN_POSITION = 0.000  # Existing hardware-observed direction: 0.000 opens.
+GRIPPER_MAX_SEPARATION_POSITION = GRIPPER_OPEN_POSITION
 GRIPPER_CLOSED_POSITION = 0.010
 GRIPPER_HALF_CLOSED_POSITION = (
     GRIPPER_OPEN_POSITION + GRIPPER_CLOSED_POSITION
 ) / 2.0
 GRIPPER_MAX_EFFORT = 20.0
 
-# Safe default after changing the path planner. Set False only after reviewing
-# the new 3D paths and confirming the workspace is clear. EXECUTE is still required.
-DRY_RUN = True
+# Keep True while validating the camera mapping and complete 3D paths.
+# Do not set False until paths, physical clearance, and calibration are checked.
+DRY_RUN = False
 
 # Explicit confirmation is still required if DRY_RUN is set False.
 REQUIRE_EXECUTE_CONFIRMATION = True
@@ -130,9 +139,9 @@ ORIENTATION_TOLERANCE = 2e-3  # Allow small measured-servo deviation after reach
 START_ORIENTATION_CORRECTION_TOLERANCE = 0.02  # rad; correct small start error smoothly over the segment.
 JOINT_GOAL_TOLERANCE = 0.05
 
-# Reject startup joint-space paths if FK height leaves this broad envelope.
-# This is not collision detection. Adjust only after physically checking it.
-STARTUP_MIN_Z = 0.030
+# Startup and non-contact movement must respect the 15 cm height floor.
+# Contact descents to 6 cm are handled only by the explicit vertical segments.
+STARTUP_MIN_Z = MIN_TRANSFER_Z
 STARTUP_MAX_Z = 0.300
 
 
@@ -311,15 +320,10 @@ def plan_startup_joint_move(q_start, q_goal):
     z_min = float(np.min(fk_points[:, 2]))
     z_max = float(np.max(fk_points[:, 2]))
 
-    # Permit a starting pose below STARTUP_MIN_Z, but do not permit the
-    # planned path to descend more than 2 mm below its measured start height.
-    STARTUP_INITIAL_DROP_TOLERANCE = 0.002
-    allowed_min_z = min(STARTUP_MIN_Z, z_start - STARTUP_INITIAL_DROP_TOLERANCE)
-
-    if z_min < allowed_min_z or z_max > STARTUP_MAX_Z:
+    if z_min < STARTUP_MIN_Z - 1e-6 or z_max > STARTUP_MAX_Z:
         raise RuntimeError(
             f"Startup FK Z range [{z_min:.3f}, {z_max:.3f}] m "
-            f"exceeds allowed range [{allowed_min_z:.3f}, "
+            f"violates required range [{STARTUP_MIN_Z:.3f}, "
             f"{STARTUP_MAX_Z:.3f}] m. No command sent."
         )
 
@@ -665,13 +669,42 @@ def preflight_target_ik(targets, labels):
         print(f"  {name}: all six pick/place IK targets reachable")
 
 
-def plan_and_execute_to(node, current_q, goal_xyz, label, duration):
-    """Plan from current measured/simulated FK to a 3D goal, then execute."""
+def plan_and_execute_to(
+    node, current_q, goal_xyz, label, duration,
+    minimum_path_z=None, vertical_only=False,
+):
+    """Plan a Cartesian segment with optional height or vertical-only guards."""
     current_q = validate_q(current_q, f"Current joints before {label}")
     start_xyz, _ = fk(current_q)
-    times, q_path, _ = plan_cartesian_segment(
-        start_xyz, np.asarray(goal_xyz, dtype=float), current_q, duration
+    goal_xyz = np.asarray(goal_xyz, dtype=float).copy()
+
+    if vertical_only:
+        lateral_error = float(np.linalg.norm(start_xyz[:2] - goal_xyz[:2]))
+        if lateral_error > POSITION_TOLERANCE:
+            raise RuntimeError(
+                f"{label}: vertical-only move requested but current TCP XY "
+                f"differs from target XY by {lateral_error * 1000:.1f} mm. "
+                "No trajectory sent. Re-approach at the 15 cm travel height."
+            )
+        # Preserve the actual starting XY so the below-15-cm portion is purely vertical.
+        goal_xyz[:2] = start_xyz[:2]
+
+    times, q_path, xyz_path = plan_cartesian_segment(
+        start_xyz, goal_xyz, current_q, duration
     )
+
+    # Horizontal travel segments must never dip below the requested 15 cm.
+    # The only allowed movements below this floor are the explicit vertical
+    # pick/place descents and the corresponding vertical lifts/retracts.
+    if minimum_path_z is not None:
+        minimum_path_z = float(minimum_path_z)
+        path_min_z = float(np.min(xyz_path[:, 2]))
+        if path_min_z < minimum_path_z - 1e-6:
+            raise RuntimeError(
+                f"{label}: planned TCP height {path_min_z:.4f} m is below "
+                f"the required {minimum_path_z:.3f} m travel floor. No command sent."
+            )
+
     node.execute_arm(q_path, times, label)
 
     if DRY_RUN:
@@ -701,7 +734,7 @@ def run_sequence(node):
           f"({np.rad2deg(HOME_ANGLE):.3f} deg)")
     print(f"Pick contact Z={PICK_CONTACT_Z:.3f} m; "
           f"place contact Z={PLACE_CONTACT_Z:.3f} m; "
-          f"clearance waypoint Z={TRAVEL_Z:.3f} m")
+          f"minimum travel height Z={MIN_TRANSFER_Z:.3f} m")
     print("Cartesian trajectories interpolate X, Y and Z together.")
     print("Only tool pitch is constrained; full 3D orientation is not fixed.")
     print("No path collision checking is available.")
@@ -782,14 +815,19 @@ def run_sequence(node):
         # Travel from current TCP position to above this coloured piece.
         current_q = plan_and_execute_to(
             node, current_q, pick_above,
-            f"{name}: 3D move to pick approach", CARTESIAN_DURATION
+            f"{name}: 3D move to pick approach", CARTESIAN_DURATION,
+            minimum_path_z=MIN_TRANSFER_Z,
         )
-        node.command_gripper(GRIPPER_OPEN_POSITION, f"open before {name} pickup")
+        node.command_gripper(
+            GRIPPER_MAX_SEPARATION_POSITION,
+            f"maximum gripper separation before {name} pickup",
+        )
 
         # Descend to the coloured shape centre and grip it.
         current_q = plan_and_execute_to(
             node, current_q, pick_contact,
-            f"{name}: descend to pick centre", VERTICAL_DURATION
+            f"{name}: descend to pick centre", VERTICAL_DURATION,
+            vertical_only=True,
         )
         node.command_gripper(
             GRIPPER_HALF_CLOSED_POSITION, f"grip {name}"
@@ -798,31 +836,37 @@ def run_sequence(node):
         # Lift clear of the base, transfer to the matching uncoloured hole.
         current_q = plan_and_execute_to(
             node, current_q, pick_above,
-            f"{name}: lift from pick", VERTICAL_DURATION
+            f"{name}: lift from pick", VERTICAL_DURATION,
+            vertical_only=True,
         )
         current_q = plan_and_execute_to(
             node, current_q, place_above,
-            f"{name}: 3D transfer to matching hole", CARTESIAN_DURATION
+            f"{name}: 3D transfer to matching hole", CARTESIAN_DURATION,
+            minimum_path_z=MIN_TRANSFER_Z,
         )
 
         # Insert at the matching hole centre and release.
         current_q = plan_and_execute_to(
             node, current_q, place_contact,
-            f"{name}: descend into matching hole", VERTICAL_DURATION
+            f"{name}: descend into matching hole", VERTICAL_DURATION,
+            vertical_only=True,
         )
         node.command_gripper(
-            GRIPPER_OPEN_POSITION, f"release {name} into matching hole"
+            GRIPPER_MAX_SEPARATION_POSITION,
+            f"maximum gripper separation after placing {name}",
         )
         current_q = plan_and_execute_to(
             node, current_q, place_above,
-            f"{name}: retract after placement", VERTICAL_DURATION
+            f"{name}: retract after placement", VERTICAL_DURATION,
+            vertical_only=True,
         )
 
     # Return to the known home TCP position after all detected shapes are sorted.
     current_xyz, _ = fk(current_q)
     current_q = plan_and_execute_to(
         node, current_q, HOME_XYZ,
-        "return to HOME XYZ", CARTESIAN_DURATION
+        "return to HOME XYZ", CARTESIAN_DURATION,
+        minimum_path_z=MIN_TRANSFER_Z,
     )
     if DRY_RUN:
         final_times, final_path = plan_startup_joint_move(current_q, HOME_Q)

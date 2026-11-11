@@ -1,0 +1,2 @@
+shape,paired_samples,pick_pixel_x,pick_pixel_y,pick_robot_x_m,pick_robot_y_m,place_pixel_x,place_pixel_y,place_robot_x_m,place_robot_y_m
+orange_hexagon,127,240.13104495418995,361.23634132713806,0.17688111284523145,0.0998953307668368,151.733222831751,313.3814326296429,0.24952472840237805,0.05508507066589641

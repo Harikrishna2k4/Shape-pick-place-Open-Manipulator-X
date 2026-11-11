@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run five-second vision averaging, then sort only available object/hole pairs."""
+"""Run ArUco-based vision averaging, then execute available shape pairs."""
 
 from datetime import datetime
 from pathlib import Path
@@ -29,8 +29,44 @@ def create_run_dir():
     return path
 
 
+def validate_targets_file(path):
+    """Check the vision/controller hand-off before starting robot software."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Targets file was not created: {path}")
+
+    import numpy as np
+
+    with np.load(path, allow_pickle=False) as data:
+        required = {"targets", "labels"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"Vision output is missing fields: {sorted(missing)}")
+
+        targets = np.asarray(data["targets"], dtype=float)
+        labels = np.asarray(data["labels"]).astype(str)
+
+    if targets.ndim != 3 or targets.shape[1:] != (2, 2):
+        raise ValueError(
+            f"Expected target array shape (N, 2, 2), got {targets.shape}."
+        )
+    if len(labels) != len(targets) or len(labels) == 0:
+        raise ValueError("Vision output has no complete pick/place pairs or mismatched labels.")
+    if not np.all(np.isfinite(targets)):
+        raise ValueError("Vision output contains non-finite robot coordinates.")
+
+    print(f"Validated {len(labels)} pick/place pair(s):", flush=True)
+    for label, pair in zip(labels, targets):
+        pick_xy, place_xy = pair
+        print(
+            f"  {label}: PICK=({pick_xy[0]:.5f}, {pick_xy[1]:.5f}) m | "
+            f"PLACE=({place_xy[0]:.5f}, {place_xy[1]:.5f}) m",
+            flush=True,
+        )
+
+
 def main():
-    print("=== SHAPE SORTING ===", flush=True)
+    print("=== ARUCO-BASED SHAPE SORTING ===", flush=True)
+
     controller = find_controller()
     if not VISION_SCRIPT.is_file() or controller is None:
         print("ERROR: Required vision/controller source file is missing.", flush=True)
@@ -41,41 +77,58 @@ def main():
 
     run_dir = create_run_dir()
     targets_file = run_dir / "shape_sort_targets.npz"
+
     env = os.environ.copy()
     env["SHAPE_SORT_RUN_DIR"] = str(run_dir)
     env["SHAPE_SORT_TARGETS_FILE"] = str(targets_file)
 
     print(f"Run folder: {run_dir}", flush=True)
-    print("STEP 1: Detect all four cardboard holes independently of coloured objects.", flush=True)
-    print("STEP 2: Average matching coloured-object/hole pairs for five seconds.", flush=True)
-    print("Zero to four coloured objects are allowed; only detected matching pairs are sent to IK.", flush=True)
+    print("STEP 1: Detect the ArUco marker in each camera frame.", flush=True)
+    print("STEP 2: Use all four measured marker corners to map image pixels to robot base_link XY.", flush=True)
+    print("STEP 3: Detect coloured-object centres and matching cardboard-hole centres.", flush=True)
+    print("STEP 4: Average the mapped PICK and PLACE coordinates over five seconds.", flush=True)
+    print("Only frames with a valid ArUco homography contribute coordinate samples.", flush=True)
     print("After averaging, press Q/ESC in the preview to accept, or X to abort.", flush=True)
 
     result = subprocess.run(
         [sys.executable, "-u", str(VISION_SCRIPT)],
-        cwd=str(SCRIPT_DIR), env=env, check=False,
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        check=False,
     )
 
     if result.returncode == NO_COLOURED_OBJECTS_EXIT:
-        print("All four cardboard holes were detected, but no coloured objects were present.", flush=True)
+        print(
+            "All four cardboard holes were detected, but no coloured objects were present.",
+            flush=True,
+        )
         print("Nothing to sort. Robot controller will NOT be started.", flush=True)
         return 0
 
     if result.returncode != 0:
-        print(f"Vision stopped with code {result.returncode}; robot controller will NOT run.", flush=True)
+        print(
+            f"Vision stopped with code {result.returncode}; robot controller will NOT run.",
+            flush=True,
+        )
         print(f"Review run folder: {run_dir}", flush=True)
         return int(result.returncode)
 
-    if not targets_file.is_file():
-        print(f"ERROR: Targets file was not created: {targets_file}", flush=True)
+    try:
+        validate_targets_file(targets_file)
+    except Exception as exc:
+        print(f"ERROR: Invalid vision output: {exc}", flush=True)
+        print("Robot controller will NOT be started.", flush=True)
         return 3
 
-    print("STEP 3: Starting IK / pick-and-place controller.", flush=True)
+    print("\nSTEP 5: Starting the existing IK / pick-and-place controller.", flush=True)
     print(f"Controller: {controller.name}", flush=True)
     print(f"Targets: {targets_file}", flush=True)
+
     robot = subprocess.run(
         [sys.executable, "-u", str(controller)],
-        cwd=str(SCRIPT_DIR), env=env, check=False,
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        check=False,
     )
     return int(robot.returncode)
 

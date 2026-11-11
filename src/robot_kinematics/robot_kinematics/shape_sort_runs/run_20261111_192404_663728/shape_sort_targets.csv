@@ -1,0 +1,2 @@
+shape,paired_samples,pick_pixel_x,pick_pixel_y,pick_robot_x_m,pick_robot_y_m,place_pixel_x,place_pixel_y,place_robot_x_m,place_robot_y_m
+green_circle,138,250.85457880033863,337.63672248236566,0.16077405818994495,0.07864216250785883,168.3930964808562,427.3013102445111,0.2695315275071324,0.16558274756307187
