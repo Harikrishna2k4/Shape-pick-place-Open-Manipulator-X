@@ -14,6 +14,7 @@ It does not estimate or correct lens distortion.
 """
 
 from pathlib import Path
+import os
 import sys
 
 import cv2
@@ -40,8 +41,15 @@ MARKER_SIDE_M = 0.037
 MARKER_TOP_RIGHT_X_M = 0.082
 MARKER_TOP_RIGHT_Y_M = 0.108
 
-# The calibration is stored beside this script.
-OUTPUT_FILE = Path(__file__).resolve().with_name("camera_to_robot.npz")
+# Select which physical plane is being calibrated:
+#   CALIBRATION_PLANE=board  -> cardboard / hole-centre plane
+#   CALIBRATION_PLANE=pick   -> top-face plane of the coloured 3D objects
+CALIBRATION_PLANE = os.environ.get("CALIBRATION_PLANE", "board").strip().lower()
+if CALIBRATION_PLANE not in {"board", "pick"}:
+    raise ValueError("CALIBRATION_PLANE must be 'board' or 'pick'.")
+OUTPUT_FILE = Path(__file__).resolve().with_name(
+    f"camera_to_robot_{CALIBRATION_PLANE}.npz"
+)
 # ----------------------------------------------------
 
 
@@ -133,6 +141,8 @@ def main():
     camera.set(cv2.CAP_PROP_FPS, FPS)
 
     print(f"Camera opened: {CAMERA_DEVICE}")
+    print(f"Calibration plane: {CALIBRATION_PLANE}")
+    print(f"Output file: {OUTPUT_FILE}")
     print(f"ArUco dictionary: {ARUCO_DICT_NAME}")
     print(f"Target marker ID: {TARGET_MARKER_ID if TARGET_MARKER_ID is not None else 'largest detected'}")
     print(f"Marker side: {MARKER_SIDE_M * 1000:.1f} mm")
@@ -265,6 +275,7 @@ def main():
                     image_height=np.int32(image_h),
                     marker_id=np.int32(selected_id),
                     dictionary=np.array(ARUCO_DICT_NAME),
+                    plane_name=np.array(CALIBRATION_PLANE),
                     marker_side_m=np.float64(MARKER_SIDE_M),
                     marker_top_right_xy_m=np.array(
                         [MARKER_TOP_RIGHT_X_M, MARKER_TOP_RIGHT_Y_M],

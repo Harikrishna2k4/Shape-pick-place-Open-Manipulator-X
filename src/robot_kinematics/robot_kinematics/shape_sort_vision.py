@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-second live shape sorting with robust cardboard-hole triangle fitting.
+"""Five-second live shape sorting with prioritised green-circle detection.
 
 No user selection is needed anywhere:
   1) The cardboard task board is found automatically.
@@ -58,18 +58,17 @@ def make_run_dir():
     return run_dir
 
 
-# ---------------------- EMBEDDED HOMOGRAPHY -----------------------
-HOMOGRAPHY = np.array([
-    [-9.62326117e-05, -9.58017569e-04,  3.95259251e-01],
-    [-9.93235342e-04,  1.83559771e-04,  5.06539104e-01],
-    [ 7.23290428e-05,  5.17757207e-04,  1.00000000e+00],
-], dtype=np.float64)
-CALIBRATION_WIDTH = 640
-CALIBRATION_HEIGHT = 480
+# --------------------- EXTERNAL CALIBRATION -----------------------
+# Generated separately by calibration_map.py. Keep both files beside this script.
+CALIBRATION_BOARD_FILE = SCRIPT_DIR / "camera_to_robot_board.npz"
+CALIBRATION_PICK_FILE = SCRIPT_DIR / "camera_to_robot_pick.npz"
 
 
 # ------------------------- OBJECT CLASSES -------------------------
 SHAPE_ORDER = ("green_circle", "blue_square", "orange_hexagon", "yellow_triangle")
+# One expected instance of each configured type on the board and at most
+# one matching coloured object of each class. This project currently defines
+# circle, square, hexagon and triangle (not a separate rectangle class).
 EXPECTED_GEOMETRY = {
     "green_circle": "circle",
     "blue_square": "square",
@@ -77,6 +76,9 @@ EXPECTED_GEOMETRY = {
     "yellow_triangle": "triangle",
 }
 GEOMETRIES = ("circle", "square", "hexagon", "triangle")
+MAX_HOLES_PER_GEOMETRY = 1
+MAX_OBJECTS_PER_CLASS = 1
+MAX_CROSS_CLASS_OBJECT_OVERLAP = 0.50
 DISPLAY_COLOURS = {
     "green_circle": (0, 255, 0),
     "blue_square": (255, 100, 0),
@@ -88,7 +90,7 @@ DISPLAY_COLOURS = {
 # orange/yellow need a high saturation floor. If your blocks are less saturated
 # than this, lower the S minimum of that colour in COLOR_RANGES.
 COLOR_RANGES = {
-    "green_circle":    (np.array([38, 90, 40], np.uint8),  np.array([88, 255, 255], np.uint8)),
+    "green_circle":    (np.array([38, 65, 65], np.uint8),  np.array([55, 255, 255], np.uint8)),
     "blue_square":     (np.array([99, 150, 60], np.uint8), np.array([120, 255, 230], np.uint8)),
     "orange_hexagon":  (np.array([5, 150, 90], np.uint8),  np.array([19, 255, 255], np.uint8)),
     "yellow_triangle": (np.array([20, 120, 90], np.uint8), np.array([37, 255, 255], np.uint8)),
@@ -101,12 +103,53 @@ COLOR_OPEN_KERNEL = 5
 COLOR_CLOSE_KERNEL = 7
 MIN_FILL_OF_MASK = 0.92         # coloured pixels / filled contour area
 MAX_INNER_HUE_STD = 10.0        # tolerate mild illumination gradients on coloured block faces
+# The green circular object is a 3-D/reflective part: its side wall and top face
+# can have different saturation/value. Use a more tolerant colour/shape gate
+# only for this class; the other coloured shapes retain the stricter defaults.
+GREEN_MIN_COLOR_FILL = 0.76
+GREEN_MAX_INNER_HUE_STD = 15.0
+GREEN_OPEN_KERNEL = 3
+GREEN_CLOSE_KERNEL = 9
+GREEN_MIN_SOLIDITY = 0.72
+GREEN_MIN_CIRCULARITY = 0.72
+GREEN_MIN_ELLIPSE_RATIO = 0.55
+GREEN_MAX_ELLIPSE_RESIDUAL = 0.18
 SIZE_RATIO_MAX = 3.0            # accepted blocks must be of broadly similar size
+
+# Coloured-object candidates are searched across the full camera ROI.
+# No fixed overall workspace polygon is imposed. The cardboard mask is still
+# excluded, and each candidate must pass its own colour, shape, size and
+# temporal-stability checks.
+OBJECT_CONFIRM_FRAMES = 5
+OBJECT_TRACK_MAX_JUMP_PX = 14.0
+OBJECT_TRACK_MAX_MISSES = 2
+
+# Per-class physical-size sanity checks at 640x480. These reject hand-held
+# oversized items, broad coloured regions and tiny reflections.
+OBJECT_MIN_AREA_PX = {
+    "green_circle": 450.0,
+    "blue_square": 300.0,
+    "orange_hexagon": 280.0,
+    "yellow_triangle": 250.0,
+}
+OBJECT_MAX_AREA_PX = {
+    "green_circle": 12000.0,
+    "blue_square": 16000.0,
+    "orange_hexagon": 14000.0,
+    "yellow_triangle": 14000.0,
+}
+OBJECT_MAX_SIDE_PX = {
+    "green_circle": 135,
+    "blue_square": 155,
+    "orange_hexagon": 150,
+    "yellow_triangle": 150,
+}
 
 # --------------------------- SHAPE TESTS --------------------------
 SOLIDITY_MIN = 0.85             # tolerate mild perspective/shadow irregularity
 TRIANGLE_SOLIDITY_MIN = 0.75
 TRIANGLE_MIN_MATCH_SCORE = 0.18
+HOLE_TRIANGLE_MAX_MATCH_SCORE = 0.10
 CIRCLE_MIN_CIRCULARITY = 0.88
 CIRCLE_MIN_ELLIPSE_RATIO = 0.80
 CIRCLE_MAX_HARMONIC = 0.030     # max amplitude of radial harmonics 3..8
@@ -135,10 +178,10 @@ MIN_CARDBOARD_FRACTION = 0.02          # strip must cover >= 2% of the frame
 # The cardboard strip is in the central-left task area in the current camera
 # setup. Restricting the search to this region prevents table/floor colours
 # outside the task area from becoming a false cardboard component.
-CARDBOARD_SEARCH_X = (0.18, 0.50)       # fractions of frame width
+CARDBOARD_SEARCH_X = (0.07, 0.50)       # fractions of frame width
 CARDBOARD_SEARCH_Y = (0.00, 1.00)       # fractions of frame height
 CARDBOARD_RECT_ASPECT = (0.12, 0.62)    # short side / long side of the strip
-CARDBOARD_CENTER_X_RANGE = (0.27, 0.44) # expected strip centre, as frame-width fractions
+CARDBOARD_CENTER_X_RANGE = (0.20, 0.34) # expected strip centre, as frame-width fractions
 MIN_HOLE_AREA_PX = 110.0
 MAX_HOLE_AREA_PX = 16000.0
 HOLE_MORPH_KERNEL = 3
@@ -151,13 +194,42 @@ MASK_WINDOW_NAME = "Colour masks (M to toggle)"
 
 
 # ============================ UTILITIES ============================
-def get_homography():
-    H = np.asarray(HOMOGRAPHY, dtype=np.float64)
+def _load_plane_homography(path, expected_plane):
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Missing {expected_plane}-plane calibration: {path}. "
+            f"Run calibration_map.py with CALIBRATION_PLANE={expected_plane} and press S."
+        )
+    with np.load(path, allow_pickle=False) as data:
+        required = {"H", "image_width", "image_height"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(f"{path.name} is missing fields: {sorted(missing)}")
+        H = np.asarray(data["H"], dtype=np.float64)
+        width = int(data["image_width"])
+        height = int(data["image_height"])
+        plane = str(data["plane_name"].item()) if "plane_name" in data.files else expected_plane
+    if plane != expected_plane:
+        raise ValueError(f"{path.name} is labelled '{plane}', expected '{expected_plane}'.")
     if H.shape != (3, 3) or not np.all(np.isfinite(H)):
-        raise ValueError("Embedded homography must be a finite 3x3 matrix.")
+        raise ValueError(f"{path.name}: homography must be a finite 3x3 matrix.")
     if abs(float(np.linalg.det(H))) < 1e-12:
-        raise ValueError("Embedded homography is singular.")
-    return H
+        raise ValueError(f"{path.name}: homography is singular.")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{path.name}: image dimensions are invalid.")
+    return H, width, height
+
+
+def get_homographies():
+    """Load the board-plane map for holes and pick-plane map for 3D object tops."""
+    H_board, bw, bh = _load_plane_homography(CALIBRATION_BOARD_FILE, "board")
+    H_pick, pw, ph = _load_plane_homography(CALIBRATION_PICK_FILE, "pick")
+    if (bw, bh) != (pw, ph):
+        raise ValueError(
+            f"Board calibration is {bw}x{bh}, but pick calibration is {pw}x{ph}. "
+            "Both maps must use the same camera resolution."
+        )
+    return H_pick, H_board, bw, bh
 
 
 def open_camera():
@@ -266,7 +338,7 @@ def detect_cardboard(frames, announce=True):
 
             vertex_score = 1.0 if vertices <= 6 else max(0.55, 1.0 - 0.06 * (vertices - 6))
             aspect_score = 1.0 - abs(aspect - 0.30)
-            centre_score = 1.0 - abs(centre_x_fraction - 0.35) / 0.10
+            centre_score = 1.0 - abs(centre_x_fraction - 0.27) / 0.10
             centre_score = max(0.05, centre_score)
             score = area * solidity * rect_fill * vertex_score * aspect_score * centre_score
             full_mask = np.zeros((h, w), np.uint8)
@@ -540,7 +612,63 @@ def fit_hole_triangle(metrics):
     # Score the hull, not the ragged source contour.
     score = float(cv2.matchShapes(
         hull, TEMPLATES["triangle"], cv2.CONTOURS_MATCH_I1, 0.0))
+    if score > HOLE_TRIANGLE_MAX_MATCH_SCORE:
+        return None, score
     return triangle, score
+
+
+def fit_hole_hexagon(metrics, contour_hex_score):
+    """Recognise the cardboard hexagonal cut-out when strict corner fitting fails.
+
+    The detected hexagonal opening in this camera view has rounded/soft edges,
+    so the strict six-vertex approximation can fail even when its contour has
+    an excellent hexagon shape-match score. This fallback is hole-only; it is
+    never used to relax coloured-block classification.
+
+    The circularity, rotated-rectangle aspect, rectangular fill and solidity
+    gates distinguish the observed hexagonal opening from the adjacent circle
+    and square holes.
+    """
+    solidity = float(metrics["solidity"])
+    circularity = float(metrics["circularity"])
+    rect_fill = float(metrics["rect_fill"])
+    aspect = float(metrics["aspect"])
+
+    if solidity < 0.80:
+        return None, float("inf")
+    if not (0.88 <= circularity <= 0.955):
+        return None, float("inf")
+    if not (0.76 <= rect_fill <= 0.90):
+        return None, float("inf")
+    if aspect < 0.95:
+        return None, float("inf")
+
+    # Reuse the contour-vs-template score already calculated by shape_fit.
+    # For the measured cut-out this score was 0.0006 (excellent match).
+    score = float(contour_hex_score)
+    if score > 0.02:
+        return None, score
+
+    # Return the best available six-corner approximation for drawing. The
+    # signature gates above remain sufficient when the noisy edge has no
+    # stable six-corner polygon at any single approximation tolerance.
+    hull = metrics["hull"]
+    perimeter = float(metrics["perimeter"])
+    six_corner_fits = []
+    for eps in np.linspace(0.01, 0.24, 80):
+        approx = cv2.approxPolyDP(hull, eps * perimeter, True)
+        if len(approx) != 6:
+            continue
+        poly = approx.reshape(-1, 2)
+        angles = polygon_internal_angles(poly)
+        if len(angles) != 6 or min(angles) < 45 or max(angles) > 165:
+            continue
+        if polygon_side_ratio(poly) > 4.0:
+            continue
+        six_corner_fits.append(poly)
+
+    polygon = six_corner_fits[len(six_corner_fits) // 2] if six_corner_fits else None
+    return polygon, score
 
 
 def shape_fit(contour):
@@ -628,15 +756,15 @@ def motion_fraction(prev_gray, gray, roi):
 
 # ===================== 3D OBJECT TOP-FACE ESTIMATION =====================
 def fit_top_face_ellipse(contour, upper_fraction=0.62):
-    """Fit the visible circular top face from the upper silhouette arc.
+    """Estimate the projected centre of a circular top face on a 3-D object.
 
-    A cylinder's coloured side wall/base can extend below its circular top.
-    Using the centroid/circularity of the complete silhouette shifts the pick
-    point and often rejects the cylinder.  The upper arc is largely unaffected
-    by that lower extension, so fit an ellipse to only the upper part of the
-    silhouette and use the ellipse centre as the top-face centre.
+    A cylinder silhouette includes the top rim plus its side wall. Fitting one
+    ellipse to a fixed 62% of that silhouette is brittle under perspective,
+    partial occlusion and shadows. Try several upper-silhouette bands and retain
+    the best geometrically plausible ellipse. This routine is used for the
+    green circular object only.
 
-    Returns (ellipse, centre, projected_area, aspect_ratio, median_residual).
+    Returns (ellipse, centre, projected_area, aspect_ratio, residual).
     """
     pts = np.asarray(contour, dtype=np.int32).reshape(-1, 2)
     if len(pts) < 12:
@@ -644,42 +772,61 @@ def fit_top_face_ellipse(contour, upper_fraction=0.62):
     x, y, w, h = cv2.boundingRect(contour)
     if w < 8 or h < 8:
         return None
-    cutoff = y + float(upper_fraction) * h
-    upper = pts[pts[:, 1] <= cutoff]
-    if len(upper) < 12:
+
+    candidates = []
+    # Different fractions accommodate both a shallow disk and a taller cylinder.
+    for fraction in (0.34, 0.42, 0.50, 0.58, float(upper_fraction), 0.70):
+        cutoff = y + fraction * h
+        upper = pts[pts[:, 1] <= cutoff]
+        if len(upper) < 12:
+            continue
+        try:
+            ellipse = cv2.fitEllipse(upper.reshape(-1, 1, 2))
+        except cv2.error:
+            continue
+
+        (cx, cy), (axis_a, axis_b), angle_deg = ellipse
+        major = max(float(axis_a), float(axis_b))
+        minor = min(float(axis_a), float(axis_b))
+        if major < 8.0 or minor < 5.0:
+            continue
+        aspect = minor / major
+        if not (GREEN_MIN_ELLIPSE_RATIO <= aspect <= 1.02):
+            continue
+        # The fitted centre must lie near the top of the complete silhouette.
+        if not (x - 0.12 * w <= cx <= x + 1.12 * w):
+            continue
+        if not (y - 0.12 * h <= cy <= y + 0.58 * h):
+            continue
+
+        theta = np.deg2rad(float(angle_deg))
+        dx = upper[:, 0].astype(np.float64) - float(cx)
+        dy = upper[:, 1].astype(np.float64) - float(cy)
+        xr = dx * np.cos(theta) + dy * np.sin(theta)
+        yr = -dx * np.sin(theta) + dy * np.cos(theta)
+        radial = np.sqrt(
+            (xr / max(float(axis_a) / 2.0, 1e-6)) ** 2 +
+            (yr / max(float(axis_b) / 2.0, 1e-6)) ** 2
+        )
+        errors = np.abs(radial - 1.0)
+        residual = float(np.median(errors))
+        p80 = float(np.percentile(errors, 80))
+        if residual > GREEN_MAX_ELLIPSE_RESIDUAL or p80 > 0.40:
+            continue
+
+        projected_area = float(np.pi * major * minor / 4.0)
+        if projected_area < MIN_COLOR_AREA_PX * 0.40:
+            continue
+        # Prefer low residuals; discourage implausibly flattened ellipses.
+        score = residual + 0.05 * max(0.0, 0.68 - aspect)
+        candidates.append((score, ellipse, (float(cx), float(cy)),
+                           projected_area, aspect, residual))
+
+    if not candidates:
         return None
-    try:
-        ellipse = cv2.fitEllipse(upper.reshape(-1, 1, 2))
-    except cv2.error:
-        return None
-    (cx, cy), (axis_a, axis_b), angle_deg = ellipse
-    major = max(float(axis_a), float(axis_b))
-    minor = min(float(axis_a), float(axis_b))
-    if major <= 1.0 or minor <= 1.0:
-        return None
-    aspect = minor / major
-    # The cap is allowed to look elliptical because the camera is oblique.
-    if aspect < 0.48:
-        return None
-    # Measure how well the upper contour follows the fitted ellipse.
-    theta = np.deg2rad(float(angle_deg))
-    dx = upper[:, 0].astype(np.float64) - float(cx)
-    dy = upper[:, 1].astype(np.float64) - float(cy)
-    xr = dx * np.cos(theta) + dy * np.sin(theta)
-    yr = -dx * np.sin(theta) + dy * np.cos(theta)
-    radial = np.sqrt((xr / max(float(axis_a) / 2.0, 1e-6)) ** 2 +
-                     (yr / max(float(axis_b) / 2.0, 1e-6)) ** 2)
-    residual = float(np.median(np.abs(radial - 1.0)))
-    if residual > 0.16:
-        return None
-    # Reject implausible ellipse centres/axes outside the parent silhouette.
-    if not (x - 0.15 * w <= cx <= x + 1.15 * w and
-            y - 0.20 * h <= cy <= y + 0.85 * h):
-        return None
-    projected_area = float(np.pi * major * minor / 4.0)
-    if projected_area < MIN_COLOR_AREA_PX * 0.45:
-        return None
-    return ellipse, (float(cx), float(cy)), projected_area, aspect, residual
+    candidates.sort(key=lambda item: item[0])
+    _, ellipse, centre, area, aspect, residual = candidates[0]
+    return ellipse, centre, area, aspect, residual
 
 
 def extract_bright_top_face(hsv, raw_mask, contour):
@@ -804,6 +951,26 @@ def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
                     "mode": "bright top-face contour",
                     "note": "top face separated from side wall",
                 }
+    # Green-circle fallback: accept a coherent elliptical/circular silhouette
+    # even when the full 3-D side-wall contour is less circular than its top.
+    # This fallback remains constrained by broad green HSV, fill, hue and area.
+    if expected == "circle" and full_metrics is not None:
+        m = full_metrics
+        green_circle_ok = (
+            m["solidity"] >= GREEN_MIN_SOLIDITY and
+            m["circularity"] >= GREEN_MIN_CIRCULARITY and
+            m["ellipse_ratio"] >= GREEN_MIN_ELLIPSE_RATIO and
+            float(np.max(m["amp"][3:9])) <= 0.11
+        )
+        if green_circle_ok:
+            return {
+                "center": m["center"], "area": float(cv2.contourArea(contour)),
+                "contour": contour, "ellipse": None, "metrics": m,
+                "score": float(1.0 - m["circularity"]),
+                "mode": "green circular silhouette fallback",
+                "note": f"circularity={m['circularity']:.2f} solidity={m['solidity']:.2f}",
+            }
+
     # Flat/2D objects without a visible separate side wall retain the original
     # whole-contour result. For 3D objects, the top-face path above takes priority.
     if full_metrics is not None and full_fits[expected][0]:
@@ -818,8 +985,62 @@ def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
     return None
 
 
+# ======================= TEMPORAL OBJECT TRACKING =======================
+def new_object_track():
+    return {"center": None, "hits": 0, "misses": 0, "last": None}
+
+
+def confirm_stationary_objects(objects, object_debug, tracks):
+    """Only publish a colour/shape candidate after it stays in place for N frames."""
+    confirmed = {}
+    for name in SHAPE_ORDER:
+        state = tracks.setdefault(name, new_object_track())
+        candidate = objects.get(name)
+
+        if candidate is None:
+            state["misses"] += 1
+            if state["hits"] >= OBJECT_CONFIRM_FRAMES and state["misses"] <= OBJECT_TRACK_MAX_MISSES:
+                if state["last"] is not None:
+                    confirmed[name] = state["last"]
+            elif state["misses"] > OBJECT_TRACK_MAX_MISSES:
+                tracks[name] = new_object_track()
+            continue
+
+        center = np.asarray(candidate["center_px"], dtype=np.float64)
+        if state["center"] is None:
+            state["center"] = center
+            state["hits"] = 1
+        elif float(np.linalg.norm(center - state["center"])) <= OBJECT_TRACK_MAX_JUMP_PX:
+            state["center"] = 0.65 * state["center"] + 0.35 * center
+            state["hits"] += 1
+        else:
+            state["center"] = center
+            state["hits"] = 1
+
+        state["misses"] = 0
+        state["last"] = candidate
+
+        if state["hits"] >= OBJECT_CONFIRM_FRAMES:
+            confirmed[name] = candidate
+        else:
+            for entry in object_debug.get(name, []):
+                if entry["contour"] is candidate["contour"]:
+                    entry["reason"] = (
+                        f"waiting for stable position ({state['hits']}/{OBJECT_CONFIRM_FRAMES})"
+                    )
+                    break
+
+    return confirmed
+
+
 # ============================ OBJECT DETECTION ============================
 def find_coloured_objects(frame, roi, exclude_mask=None):
+    """Detect at most one object per colour/shape across the full camera ROI.
+
+    The cardboard is excluded with exclude_mask; there is no fixed global
+    object-workspace polygon. Colour, geometry, dimensions and tracking are
+    used to reject unrelated scene regions.
+    """
     blurred = cv2.GaussianBlur(frame, (3, 3), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     objects = {}
@@ -829,9 +1050,10 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
     any_colour = np.zeros(frame.shape[:2], dtype=np.uint8)
     open_k = np.ones((COLOR_OPEN_KERNEL, COLOR_OPEN_KERNEL), np.uint8)
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (COLOR_CLOSE_KERNEL,) * 2)
+    green_open_k = np.ones((GREEN_OPEN_KERNEL, GREEN_OPEN_KERNEL), np.uint8)
+    green_close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (GREEN_CLOSE_KERNEL,) * 2)
     roi_area = max((roi[2] - roi[0]) * (roi[3] - roi[1]), 1)
     max_area = min(MAX_COLOR_AREA_PX, MAX_ROI_FRACTION * roi_area)
-
     for name in SHAPE_ORDER:
         lower, upper = COLOR_RANGES[name]
         raw = cv2.inRange(hsv, lower, upper)
@@ -839,15 +1061,20 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
         if exclude_mask is not None:
             raw[exclude_mask > 0] = 0
         raw_masks[raw > 0] = DISPLAY_COLOURS[name]
-        mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, open_k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
+        if name == "green_circle":
+            # Preserve smaller green rim segments, then join small lighting gaps.
+            mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, green_open_k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, green_close_k)
+        else:
+            mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, open_k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k)
         any_colour |= mask
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         accepted = []
 
         for contour in contours:
             full_area = float(cv2.contourArea(contour))
-            if full_area < MIN_COLOR_AREA_PX:
+            if full_area < max(MIN_COLOR_AREA_PX, OBJECT_MIN_AREA_PX[name]):
                 continue
             full_metrics, full_fits = shape_fit(contour)
             entry = {
@@ -859,10 +1086,17 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
             if full_metrics is None:
                 entry["reason"] = "degenerate"
                 continue
-            if full_area > max_area:
-                entry["reason"] = "too large"
+            class_max_area = min(max_area, OBJECT_MAX_AREA_PX[name])
+            if full_area > class_max_area:
+                entry["reason"] = f"too large ({full_area:.0f}px > {class_max_area:.0f}px)"
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+            if max(w, h) > OBJECT_MAX_SIDE_PX[name]:
+                entry["reason"] = f"too large in image ({max(w, h)}px side)"
+                continue
+            if min(w, h) < 12:
+                entry["reason"] = "too small in image"
+                continue
             if x <= roi[0] + 2 or y <= roi[1] + 2 or x + w >= roi[2] - 2 or y + h >= roi[3] - 2:
                 entry["reason"] = "touches ROI edge"
                 continue
@@ -872,13 +1106,16 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
             filled = np.zeros(mask.shape, np.uint8)
             cv2.drawContours(filled, [contour], -1, 255, cv2.FILLED)
             fill = float(np.count_nonzero(raw[filled > 0])) / max(np.count_nonzero(filled), 1)
-            if fill < MIN_FILL_OF_MASK:
-                entry["reason"] = f"colour fill {fill:.2f}"
+            min_fill = GREEN_MIN_COLOR_FILL if name == "green_circle" else MIN_FILL_OF_MASK
+            if fill < min_fill:
+                entry["reason"] = f"colour fill {fill:.2f} < {min_fill:.2f}"
                 continue
-            inner = cv2.erode(filled, np.ones((5, 5), np.uint8))
+            inner_kernel = np.ones((3, 3), np.uint8) if name == "green_circle" else np.ones((5, 5), np.uint8)
+            inner = cv2.erode(filled, inner_kernel)
             hues = hsv[..., 0][inner > 0].astype(np.float32)
-            if hues.size >= 20 and float(np.std(hues)) > MAX_INNER_HUE_STD:
-                entry["reason"] = f"hue spread {np.std(hues):.1f}"
+            max_hue_std = GREEN_MAX_INNER_HUE_STD if name == "green_circle" else MAX_INNER_HUE_STD
+            if hues.size >= 20 and float(np.std(hues)) > max_hue_std:
+                entry["reason"] = f"hue spread {np.std(hues):.1f} > {max_hue_std:.1f}"
                 continue
 
             top = analyse_top_face(name, hsv, raw, contour, full_metrics, full_fits)
@@ -907,11 +1144,13 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
         if not accepted:
             continue
         accepted.sort(key=lambda item: item["score"])
-        if (len(accepted) > 1 and
-                accepted[1]["full_area"] >= 0.70 * accepted[0]["full_area"]):
+        if len(accepted) > 1:
             for item in accepted:
-                item["entry"]["reason"] = "ambiguous (several candidates)"
+                item["entry"]["reason"] = (
+                    "multiple same-colour, same-shape candidates; refusing to guess"
+                )
             continue
+        accepted = accepted[:MAX_OBJECTS_PER_CLASS]
         best = accepted[0]
         objects[name] = {
             "center_px": best["center"],
@@ -922,6 +1161,43 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
             "face_mode": best["face_mode"],
             "metrics": best["metrics"],
         }
+
+    # Cross-class uniqueness: two labels must not describe the same physical
+    # coloured blob. Compare filled-contour overlap and reject both on ambiguity.
+    overlapping_names = set()
+    if len(objects) > 1:
+        names = list(objects)
+        contour_masks = {}
+        for name in names:
+            cm = np.zeros(frame.shape[:2], dtype=np.uint8)
+            cv2.drawContours(cm, [objects[name]["contour"]], -1, 255, cv2.FILLED)
+            contour_masks[name] = cm > 0
+        for i, name_a in enumerate(names):
+            for name_b in names[i + 1:]:
+                a = contour_masks[name_a]
+                b = contour_masks[name_b]
+                intersection = int(np.count_nonzero(a & b))
+                union = int(np.count_nonzero(a | b))
+                iou = intersection / max(union, 1)
+                if iou >= MAX_CROSS_CLASS_OBJECT_OVERLAP:
+                    # Green circle is the priority class. If it overlaps a
+                    # second colour label, retain green and reject the other;
+                    # all non-green overlaps remain ambiguous and reject both.
+                    if name_a == "green_circle" and name_b != "green_circle":
+                        overlapping_names.add(name_b)
+                    elif name_b == "green_circle" and name_a != "green_circle":
+                        overlapping_names.add(name_a)
+                    else:
+                        overlapping_names.update((name_a, name_b))
+
+    for name in overlapping_names:
+        for entry in debug[name]:
+            if entry["contour"] is objects[name]["contour"]:
+                entry["reason"] = "overlaps another colour class; duplicate object rejected"
+        del objects[name]
+
+    if len(objects) > len(SHAPE_ORDER):
+        raise RuntimeError("Coloured-object detector exceeded configured class cardinality.")
 
     # Cross-object size sanity is now based on visible top-face areas rather
     # than the larger silhouette areas that include side walls/extensions.
@@ -935,6 +1211,11 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
                         e["reason"] = "top-face size outlier"
                 del objects[name]
 
+    # The public object map is keyed by the four configured colour/shape names,
+    # and every key is limited to one selected physical object.
+    if len(objects) > len(SHAPE_ORDER) or len(set(objects.keys())) != len(objects):
+        raise RuntimeError("Coloured-object detector violated one-object-per-class rule.")
+
     object_mask |= any_colour
     for obj in objects.values():
         cv2.drawContours(object_mask, [obj["contour"]], -1, 255, cv2.FILLED)
@@ -945,6 +1226,8 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
 # ============================ HOLE DETECTION ============================
 def find_holes(frame, strip, roi):
     """Find cut-outs as non-cardboard regions enclosed by the board footprint.
+
+    At most one hole per configured geometry is selected.
 
     This is independent of all coloured-object detections. The clean fitted
     board rectangle defines the search interior; pixels that do not match the
@@ -996,28 +1279,212 @@ def find_holes(frame, strip, roi):
             metrics["polygon_triangle"] = hole_triangle
             metrics["hole_triangle_hull_fit"] = True
 
+        # Cardboard-only fallback for the rounded/soft-edged hexagonal opening.
+        hole_hexagon, hole_hexagon_score = fit_hole_hexagon(metrics, fits["hexagon"][1])
+        if np.isfinite(hole_hexagon_score):
+            if not fits["hexagon"][0] or hole_hexagon_score < fits["hexagon"][1]:
+                fits["hexagon"] = (True, hole_hexagon_score, "")
+            if hole_hexagon is not None:
+                metrics["polygon_hexagon"] = hole_hexagon
+            metrics["hole_hexagon_signature_fit"] = True
+            metrics["hole_hexagon_signature_score"] = hole_hexagon_score
+
         passing = [g for g in GEOMETRIES if fits[g][0]]
         reason = "" if passing else min((fits[g][2] for g in GEOMETRIES), key=len)
-        geometry = min(passing, key=lambda g: fits[g][1]) if passing else "unknown"
+
+        # If the dedicated cardboard-hexagon signature passed, it is the
+        # authoritative class for this hole. Do not let a simultaneous square
+        # template pass relabel this same candidate as a square.
+        if metrics.get("hole_hexagon_signature_fit", False):
+            geometry = "hexagon"
+        else:
+            geometry = min(passing, key=lambda g: fits[g][1]) if passing else "unknown"
         candidates.append({
             "center_px": metrics["center"], "area_px": area,
             "geometry": geometry, "fits": fits, "contour": contour,
             "metrics": metrics, "ok": bool(passing), "reason": reason,
         })
 
+
+    # HARD-CODED TASK-BOARD INVENTORY / LAYOUT:
+    # There is exactly one circle, one hexagon, one square and one triangle.
+    # The circular cut-out is at one end of the strip. The cut-out immediately
+    # adjacent to the circle along the board's long axis is ALWAYS the hexagon.
+    # This positional rule deliberately overrides a square-template pass for
+    # that same hole (the measured hexagon can resemble a square in silhouette).
+    # The remaining two holes are assigned by their own square/triangle fits.
+    # No candidate can be reused for two shape classes.
+
     selected = {}
-    for name in SHAPE_ORDER:
-        expected = EXPECTED_GEOMETRY[name]
-        options = [
-            (float(c["fits"][expected][1]), c)
-            for c in candidates if c["ok"] and c["fits"][expected][0]
+    used_ids = set()
+    reserved_ids = set()
+
+    # Derive the cardboard strip's longitudinal axis from its fitted polygon.
+    board_pts = np.asarray(strip["board_polygon"], dtype=np.float64).reshape(-1, 2)
+    board_centre = np.mean(board_pts, axis=0)
+    centred = board_pts - board_centre
+    covariance = centred.T @ centred
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    long_axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+    # Fix the sign for reproducible diagnostics; distances below are absolute.
+    if long_axis[1] < 0:
+        long_axis = -long_axis
+
+    def longitudinal_position(candidate):
+        centre = np.asarray(candidate["center_px"], dtype=np.float64)
+        return float(np.dot(centre - board_centre, long_axis))
+
+    # 1) Find the unique circle using the circle-specific contour checks.
+    circle_options = [
+        c for c in candidates
+        if c["fits"]["circle"][0]
+        and c["metrics"]["circularity"] >= 0.90
+        and c["metrics"]["ellipse_ratio"] >= CIRCLE_MIN_ELLIPSE_RATIO
+    ]
+    circle_options.sort(key=lambda c: float(c["fits"]["circle"][1]))
+    circle_candidate = circle_options[0] if circle_options else None
+    # Any contour with a strong circle fit is reserved from square/triangle
+    # reassignment, even if it is not the winning circle candidate.
+    reserved_ids.update(id(c) for c in circle_options)
+
+    if circle_candidate is not None:
+        circle_candidate["geometry"] = "circle"
+        circle_candidate["ok"] = True
+        circle_candidate["reason"] = ""
+        circle_candidate["layout_rule"] = "circle end of cardboard strip"
+        selected["green_circle"] = circle_candidate
+        used_ids.add(id(circle_candidate))
+
+        # 2) The nearest distinct hole along the board axis is hard-coded as
+        # the hexagon. Its hexagon-template score must still be plausible; the
+        # positional rule resolves square-vs-hexagon ambiguity, not bad contours.
+        other_candidates = [
+            c for c in candidates
+            if id(c) not in used_ids and id(c) not in reserved_ids
         ]
-        options.sort(key=lambda item: item[0])
-        if options:
-            # Refuse to guess when duplicate cut-outs have nearly identical fits.
-            if len(options) > 1 and abs(options[1][0] - options[0][0]) < 0.02:
-                continue
-            selected[name] = options[0][1]
+        other_candidates.sort(
+            key=lambda c: abs(longitudinal_position(c) - longitudinal_position(circle_candidate))
+        )
+        adjacent = other_candidates[0] if other_candidates else None
+
+        if adjacent is not None:
+            # The adjacent slot is the hexagon slot by the supplied board layout.
+            # If its contour fails the hexagon gate, leave it missing; never relabel
+            # that slot as a square or triangle.
+            reserved_ids.add(id(adjacent))
+            mm = adjacent["metrics"]
+            hex_score = float(adjacent["fits"]["hexagon"][1])
+            hex_signature_ok = (
+                np.isfinite(hex_score)
+                and hex_score <= 0.08
+                and mm["solidity"] >= 0.80
+                and 0.86 <= mm["circularity"] <= 0.975
+                and 0.70 <= mm["rect_fill"] <= 0.93
+                and mm["aspect"] >= 0.90
+            )
+            if hex_signature_ok:
+                adjacent["geometry"] = "hexagon"
+                adjacent["ok"] = True
+                adjacent["reason"] = ""
+                adjacent["fits"]["hexagon"] = (
+                    True, hex_score, "adjacent-to-circle cardboard layout rule"
+                )
+                adjacent["layout_rule"] = "immediately adjacent to circle = hexagon"
+                adjacent["metrics"]["layout_hexagon_override"] = True
+                selected["orange_hexagon"] = adjacent
+                used_ids.add(id(adjacent))
+            else:
+                adjacent["layout_rule"] = "adjacent-to-circle candidate failed hexagon shape gate"
+                print(
+                    "[HOLE LAYOUT] The hole adjacent to the circle did not pass the "
+                    f"hexagon shape gate (hex score={hex_score:.4f}); hexagon left unassigned.",
+                    flush=True,
+                )
+
+    # 3) Assign the one remaining square candidate, excluding circle and hexagon.
+    square_options = [
+        c for c in candidates
+        if id(c) not in reserved_ids and id(c) not in used_ids
+        and c["fits"]["square"][0]
+    ]
+    square_options.sort(key=lambda c: float(c["fits"]["square"][1]))
+    if square_options:
+        square_candidate = square_options[0]
+        square_candidate["geometry"] = "square"
+        square_candidate["ok"] = True
+        square_candidate["reason"] = ""
+        square_candidate["layout_rule"] = "remaining square-shaped cardboard opening"
+        selected["blue_square"] = square_candidate
+        used_ids.add(id(square_candidate))
+        reserved_ids.update(id(c) for c in square_options)
+
+    # 4) Assign the one remaining triangle candidate.
+    triangle_options = [
+        c for c in candidates
+        if id(c) not in reserved_ids and id(c) not in used_ids
+        and c["fits"]["triangle"][0]
+    ]
+    triangle_options.sort(key=lambda c: float(c["fits"]["triangle"][1]))
+    if triangle_options:
+        triangle_candidate = triangle_options[0]
+        triangle_candidate["geometry"] = "triangle"
+        triangle_candidate["ok"] = True
+        triangle_candidate["reason"] = ""
+        triangle_candidate["layout_rule"] = "remaining triangular cardboard opening"
+        selected["yellow_triangle"] = triangle_candidate
+        used_ids.add(id(triangle_candidate))
+
+    # Reject all extras and guarantee that each physical hole is assigned once.
+    for candidate in candidates:
+        if id(candidate) not in used_ids:
+            candidate["ok"] = False
+            candidate["reason"] = "not one of the four unique cardboard holes"
+
+    if len(selected) > 4 or len({id(c) for c in selected.values()}) != len(selected):
+        raise RuntimeError("Cardboard hole assignment violated the four-unique-hole rule.")
+
+    # One-time diagnostics for cardboard-hole geometry classification.
+    if candidates and len(candidates) >= 3 and not getattr(find_holes, "_diagnostics_printed", False):
+        print("\\n========== HOLE GEOMETRY DIAGNOSTICS ==========", flush=True)
+
+        for i, c in enumerate(candidates):
+            m = c["metrics"]
+            print(
+                f"Candidate {i + 1}: centre={np.round(c['center_px'], 1)}, "
+                f"area={c['area_px']:.0f}, assigned={c['geometry']}, "
+                f"solidity={m['solidity']:.3f}, "
+                f"circularity={m['circularity']:.3f}, "
+                f"rect_fill={m['rect_fill']:.3f}, "
+                f"aspect={m['aspect']:.3f}, "
+                f"tri_fill={m['tri_fill']:.3f}, "
+                f"h6={m['amp'][6]:.3f}, "
+                f"triangle_hull_fit={m.get('hole_triangle_hull_fit', False)}, "
+                f"hexagon_hull_fit={m.get('hole_hexagon_signature_fit', False)}, "
+                f"layout_rule={c.get('layout_rule', 'unassigned')}",
+                flush=True
+            )
+
+            for geometry in GEOMETRIES:
+                ok, score, reason = c["fits"][geometry]
+                print(
+                    f"    {geometry}: {'PASS' if ok else 'FAIL'} "
+                    f"score={score:.4f} "
+                    f"{'' if ok else 'reason=' + reason}",
+                    flush=True
+                )
+
+        print("Selected cardboard holes:", flush=True)
+        for name, hole in selected.items():
+            print(
+                f"    {name}: centre={np.round(hole['center_px'], 1)}, "
+                f"candidate_geometry={hole['geometry']}",
+                flush=True
+            )
+
+        print("================================================\\n", flush=True)
+        find_holes._diagnostics_printed = True
+
+
 
     return selected, full_mask, candidates
 
@@ -1038,6 +1505,9 @@ def draw_overlay(frame, roi, strip, objects, object_debug, holes, hole_candidate
                  sample_counts, elapsed, averaged=None, averaging_done=False, motion=0.0):
     display = frame.copy()
     fh, fw = frame.shape[:2]
+    cv2.putText(display, "COLOUR + SHAPE DETECTION: FULL CAMERA ROI",
+                (8, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                (255, 255, 255), 1, cv2.LINE_AA)
     search_x1 = int(round(CARDBOARD_SEARCH_X[0] * fw))
     search_x2 = int(round(CARDBOARD_SEARCH_X[1] * fw))
     search_y1 = int(round(CARDBOARD_SEARCH_Y[0] * fh))
@@ -1211,7 +1681,11 @@ def main():
         run_dir / "shape_sort_targets.csv",
     )
     print(f"Run folder: {run_dir}", flush=True)
-    H = get_homography()
+    H_pick, H_board, calibration_width, calibration_height = get_homographies()
+    print(f"Loaded board-plane calibration: {CALIBRATION_BOARD_FILE}", flush=True)
+    print(f"Loaded object-top calibration: {CALIBRATION_PICK_FILE}", flush=True)
+    print(f"Calibration resolution: {calibration_width}x{calibration_height}", flush=True)
+    print("Object pick pixels use H_pick; cardboard-hole place pixels use H_board.", flush=True)
     camera = open_camera()
     try:
         ok, first_frame = camera.read()
@@ -1219,9 +1693,11 @@ def main():
             raise RuntimeError("Could not read initial camera frame.")
         fh, fw = first_frame.shape[:2]
         print(f"Camera frame: {fw}x{fh}", flush=True)
-        if (fw, fh) != (CALIBRATION_WIDTH, CALIBRATION_HEIGHT):
-            raise RuntimeError(f"Camera frame {fw}x{fh} does not match homography resolution "
-                               f"{CALIBRATION_WIDTH}x{CALIBRATION_HEIGHT}.")
+        if (fw, fh) != (calibration_width, calibration_height):
+            raise RuntimeError(
+                f"Camera frame {fw}x{fh} does not match saved calibration resolution "
+                f"{calibration_width}x{calibration_height}. Recalibrate at the current resolution."
+            )
         warm = [first_frame] + [camera.read()[1] for _ in range(9)]
         warm = [f for f in warm if f is not None]
         roi = (3, 3, fw - 3, fh - 3)
@@ -1234,6 +1710,12 @@ def main():
         print("Keep the board and any coloured blocks stationary during the 5-second average.", flush=True)
 
         data = new_sample_store()
+        object_tracks = {n: new_object_track() for n in SHAPE_ORDER}
+        print(
+            "COLOURED OBJECTS: colour + expected geometry + size limits + full camera ROI "
+            f"+ {OBJECT_CONFIRM_FRAMES}-frame position confirmation.",
+            flush=True
+        )
         seen_block = {n: 0 for n in SHAPE_ORDER}
         seen_hole = {n: 0 for n in SHAPE_ORDER}
         hole_pixel_samples = {n: [] for n in SHAPE_ORDER}
@@ -1269,6 +1751,15 @@ def main():
 
             objects, object_mask, object_debug, raw_masks = find_coloured_objects(
                 frame, roi, None if strip is None else strip["mask"])
+            if motion > MOTION_FRACTION_MAX:
+                object_tracks = {n: new_object_track() for n in SHAPE_ORDER}
+                objects = {}
+                for name in SHAPE_ORDER:
+                    for entry in object_debug.get(name, []):
+                        if not entry.get("reason"):
+                            entry["reason"] = "motion in scene; waiting for stationary view"
+            else:
+                objects = confirm_stationary_objects(objects, object_debug, object_tracks)
             holes, hole_mask, hole_candidates = find_holes(frame, strip, roi)
 
             if not averaging_done:
@@ -1292,8 +1783,8 @@ def main():
                             hp = holes[name]["center_px"]
                             data[name]["pick_pixel"].append(np.asarray(pp, float))
                             data[name]["place_pixel"].append(np.asarray(hp, float))
-                            data[name]["pick_robot"].append(pixel_to_robot_xy(pp, H))
-                            data[name]["place_robot"].append(pixel_to_robot_xy(hp, H))
+                            data[name]["pick_robot"].append(pixel_to_robot_xy(pp, H_pick))
+                            data[name]["place_robot"].append(pixel_to_robot_xy(hp, H_board))
                 last_counts = {n: len(data[n]["pick_robot"]) for n in SHAPE_ORDER}
                 elapsed = time.monotonic() - start
 

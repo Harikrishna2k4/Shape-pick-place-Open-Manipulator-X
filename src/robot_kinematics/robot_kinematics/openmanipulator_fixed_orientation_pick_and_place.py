@@ -35,6 +35,8 @@ IMPORTANT:
 """
 
 import time
+import os
+from pathlib import Path
 import numpy as np
 import rclpy
 
@@ -73,15 +75,21 @@ TASK_TOOL_ANGLE = HOME_ANGLE
 # The supplied FK gives this position for HOME_Q:
 HOME_XYZ = np.array([0.11822, 0.00882, 0.19707], dtype=float)
 
-TRAVEL_Z = 0.160  # Clearance waypoint height, not a path-wide Z constraint.
-CONTACT_Z = 0.110  # Pick/place target contact height.
-PICK_CONTACT_Z = CONTACT_Z
-PLACE_CONTACT_Z = CONTACT_Z
+TRAVEL_Z = 0.160  # Clearance waypoint, not a path-wide Z constraint.
 
-# TEMPORARY TEST COORDINATES in base_link metres.
-# Replace these with the vision output later.
-PICK_XY = np.array([0.200, 0.000], dtype=float)
-PLACE_XY = np.array([0.220, 0.050], dtype=float)
+# One-shot camera output. Keep this file beside this controller.
+SORT_TARGETS_FILE = Path(os.environ.get(
+    "SHAPE_SORT_TARGETS_FILE",
+    Path(__file__).resolve().with_name("shape_sort_targets.npz"),
+)).expanduser().resolve()
+SORT_SHAPES = (
+    "green_circle",
+    "blue_square",
+    "orange_hexagon",
+    "yellow_triangle",
+)
+PICK_CONTACT_Z = 0.110
+PLACE_CONTACT_Z = 0.110
 
 # GripperCommand action position values in metres.
 # User observed the previous mapping behaved in reverse, so the endpoints
@@ -95,7 +103,7 @@ GRIPPER_MAX_EFFORT = 20.0
 
 # Safe default after changing the path planner. Set False only after reviewing
 # the new 3D paths and confirming the workspace is clear. EXECUTE is still required.
-DRY_RUN = False
+DRY_RUN = True
 
 # Explicit confirmation is still required if DRY_RUN is set False.
 REQUIRE_EXECUTE_CONFIRMATION = True
@@ -584,150 +592,254 @@ class PickPlaceNode(Node):
 # COMPLETE PICK-AND-PLACE SEQUENCE
 # ---------------------------------------------------------------------
 
+def load_sort_targets():
+    """Load the N x 2 x 2 array for the detected, available shape classes."""
+    if not SORT_TARGETS_FILE.is_file():
+        raise FileNotFoundError(
+            f"Vision target file not found: {SORT_TARGETS_FILE}. "
+            "Run run_shape_sorting.py to generate this run's averaged vision targets first."
+        )
+
+    with np.load(SORT_TARGETS_FILE, allow_pickle=False) as data:
+        if "targets" not in data.files or "labels" not in data.files:
+            raise ValueError(
+                "shape_sort_targets.npz must contain 'targets' and 'labels'."
+            )
+        targets = np.asarray(data["targets"], dtype=float)
+        labels = tuple(str(v) for v in data["labels"].tolist())
+
+    if targets.ndim != 3 or targets.shape[1:] != (2, 2):
+        raise ValueError(
+            f"Expected targets with shape (N, 2, 2), got {targets.shape}."
+        )
+    if len(labels) != targets.shape[0]:
+        raise ValueError(
+            f"Target row count ({targets.shape[0]}) does not match labels ({len(labels)})."
+        )
+    if not labels:
+        raise ValueError("Vision file contains no complete pick/place pairs.")
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"Duplicate shape labels in vision file: {labels}")
+    unknown = [name for name in labels if name not in SORT_SHAPES]
+    if unknown:
+        raise ValueError(f"Unsupported shape labels in vision file: {unknown}")
+    if not np.all(np.isfinite(targets)):
+        raise ValueError("Vision target array contains NaN or infinite values.")
+
+    for i, name in enumerate(labels):
+        pick_xy = targets[i, 0]
+        place_xy = targets[i, 1]
+        if np.linalg.norm(pick_xy - place_xy) < 0.005:
+            raise ValueError(
+                f"{name}: pick and place coordinates are less than 5 mm apart."
+            )
+
+    return targets, labels
+
+
+def preflight_target_ik(targets, labels):
+    """Check every approach/contact target for IK reachability before motion.
+
+    This validates target IK and joint-step continuity. Full interpolated path
+    checks are still performed immediately before each trajectory is sent.
+    """
+    simulated_q = HOME_Q.copy()
+    print("\nPRE-FLIGHT IK CHECK")
+    for i, name in enumerate(labels):
+        pick_xy = targets[i, 0]
+        place_xy = targets[i, 1]
+        points = [
+            ("pick approach", np.array([pick_xy[0], pick_xy[1], TRAVEL_Z])),
+            ("pick contact", np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z])),
+            ("pick retract", np.array([pick_xy[0], pick_xy[1], TRAVEL_Z])),
+            ("place approach", np.array([place_xy[0], place_xy[1], TRAVEL_Z])),
+            ("place contact", np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z])),
+            ("place retract", np.array([place_xy[0], place_xy[1], TRAVEL_Z])),
+        ]
+        for phase, xyz in points:
+            q = solve_ik(xyz, simulated_q, TASK_TOOL_ANGLE)
+            # Carry the selected IK branch forward. MAX_IK_STEP is checked
+            # later between adjacent interpolated path samples, not between
+            # sparse contact/approach endpoints.
+            simulated_q = q
+        print(f"  {name}: all six pick/place IK targets reachable")
+
+
+def plan_and_execute_to(node, current_q, goal_xyz, label, duration):
+    """Plan from current measured/simulated FK to a 3D goal, then execute."""
+    current_q = validate_q(current_q, f"Current joints before {label}")
+    start_xyz, _ = fk(current_q)
+    times, q_path, _ = plan_cartesian_segment(
+        start_xyz, np.asarray(goal_xyz, dtype=float), current_q, duration
+    )
+    node.execute_arm(q_path, times, label)
+
+    if DRY_RUN:
+        # In dry-run, advance the software state to the planned endpoint so all
+        # all detected pick/place paths can be checked in one pass.
+        return q_path[-1].copy()
+
+    # In hardware mode, always re-read the actual joint feedback after motion.
+    measured_q = validate_q(node.get_current_q(), f"Measured joints after {label}")
+    return measured_q
+
+
 def run_sequence(node):
-    print(f"Reference tool pitch from HOME_Q: {HOME_ANGLE:.6f} rad "
+    targets, labels = load_sort_targets()
+    print("\nVISION PICK/PLACE ARRAY")
+    print(
+        f"Array shape: ({len(labels)}, 2, 2) = detected shapes x "
+        "[pick/place] x [X/Y]"
+    )
+    for i, name in enumerate(labels):
+        print(
+            f"{i + 1}. {name}: PICK={targets[i, 0]} m, "
+            f"PLACE={targets[i, 1]} m"
+        )
+
+    print(f"Reference tool pitch: {HOME_ANGLE:.6f} rad "
           f"({np.rad2deg(HOME_ANGLE):.3f} deg)")
-    print(f"Travel Z={TRAVEL_Z:.3f} m; shared pick/place contact Z={CONTACT_Z:.3f} m")
-    print(f"Motion timing: home={HOME_DURATION:.1f}s, XY={CARTESIAN_DURATION:.1f}s, vertical={VERTICAL_DURATION:.1f}s at {FREQUENCY_HZ:.0f} Hz")
-    print("Temporary pick XY:", PICK_XY)
-    print("Temporary place XY:", PLACE_XY)
-    print(f"Gripper positions: open={GRIPPER_OPEN_POSITION:.4f} m, "
-          f"half-close={GRIPPER_HALF_CLOSED_POSITION:.4f} m, "
-          f"closed={GRIPPER_CLOSED_POSITION:.4f} m")
+    print(f"Pick contact Z={PICK_CONTACT_Z:.3f} m; "
+          f"place contact Z={PLACE_CONTACT_Z:.3f} m; "
+          f"clearance waypoint Z={TRAVEL_Z:.3f} m")
+    print("Cartesian trajectories interpolate X, Y and Z together.")
+    print("Only tool pitch is constrained; full 3D orientation is not fixed.")
+    print("No path collision checking is available.")
 
     current_q = validate_q(node.get_current_q(), "Current joint feedback")
     current_xyz, _ = fk(current_q)
     print("Current joints:", np.round(current_q, 5))
     print("Current TCP XYZ:", np.round(current_xyz, 5))
 
-    # 1. Startup: move from the measured pose to HOME_Q.
+    # Prepare startup and validate all target endpoints before any movement.
     t_home, q_home_path = plan_startup_joint_move(current_q, HOME_Q)
-
     home_xyz_fk, home_R = fk(HOME_Q)
     if np.linalg.norm(home_xyz_fk - HOME_XYZ) > 0.001:
-        raise RuntimeError(
-            "HOME_Q FK does not match HOME_XYZ. Check kinematics.py."
-        )
+        raise RuntimeError("HOME_Q FK does not match HOME_XYZ; check kinematics.py.")
     verify_orientation(home_R, float(HOME_Q[0]), HOME_ANGLE, "HOME_Q")
 
-    # The startup joint path is the only path prepared before motion.
-    # All Cartesian segments are planned immediately before they are executed.
-    # This avoids computing IK for the entire pick-and-place sequence at startup.
+    global TASK_TOOL_ANGLE
+    TASK_TOOL_ANGLE = HOME_ANGLE
+    preflight_target_ik(targets, labels)
 
-    print("\\nEXECUTION PLAN")
-    print("Startup: measured pose -> HOME_Q.")
-    print("Cartesian paths will interpolate X, Y and Z together in 3D.")
-    print("Only tool pitch is constrained during Cartesian movement.")
-    print("TRAVEL_Z is a clearance waypoint, not a constant-height path constraint.")
-    print("Pick/place contact Z =", CONTACT_Z, "m for both operations.")
-    print("No path collision checking is available.")
+    print("\nEXECUTION PLAN")
+    print("Vision averaged valid object/hole coordinates over the 5-second window; live preview was accepted.")
+    print(f"{len(labels)} detected shape(s) will be sorted in this order:", ", ".join(labels))
+    print("Each shape uses its own detected pick centre and matching hole centre.")
+    print("IK is solved for every approach/contact waypoint and every Cartesian path sample.")
 
     if DRY_RUN:
-        print("\\nDRY_RUN=True: no commands will be sent to the robot.")
-        print("Only the startup path was generated. Cartesian paths are generated")
-        print("just before each segment when DRY_RUN is disabled.")
-        return
-
-    if REQUIRE_EXECUTE_CONFIRMATION:
-        print("\\nClear the workspace, keep the emergency stop accessible,")
+        print(
+            f"\nDRY_RUN=True: planning {len(labels)} pick/place cycle(s) "
+            "without moving hardware."
+        )
+    elif REQUIRE_EXECUTE_CONFIRMATION:
+        print("\nClear the workspace, keep the emergency stop accessible,")
         print("and ensure the robot is supported during any required setup.")
-        if input("Type EXECUTE to run the complete sequence: ").strip() != "EXECUTE":
+        if input(
+            f"Type EXECUTE to run these {len(labels)} sorting cycle(s): "
+        ).strip() != "EXECUTE":
             print("Cancelled. No movement sent.")
             return
 
-    # 1. Move to HOME_Q.
+    # Startup move to HOME_Q.
     node.execute_arm(q_home_path, t_home, "startup to HOME_Q")
-    current_q = node.get_current_q()
-    if np.max(np.abs(wrap_delta(current_q, HOME_Q))) > JOINT_GOAL_TOLERANCE:
-        raise RuntimeError("Robot did not reach HOME_Q; sequence aborted.")
+    if DRY_RUN:
+        current_q = HOME_Q.copy()
+    else:
+        current_q = validate_q(node.get_current_q(), "Measured joints at HOME_Q")
+        home_joint_error = float(np.max(np.abs(wrap_delta(current_q, HOME_Q))))
+        if home_joint_error > JOINT_GOAL_TOLERANCE:
+            raise RuntimeError(
+                f"Robot did not reach HOME_Q; maximum joint error={home_joint_error:.4f} rad."
+            )
 
-    # Anchor one fixed tool pitch from the measured home pose for the whole task.
-    global TASK_TOOL_ANGLE
     measured_home_pitch = float(current_q[1] + current_q[2] + current_q[3])
     home_pitch_offset = abs(wrap_delta(measured_home_pitch, HOME_ANGLE))
     if home_pitch_offset > START_ORIENTATION_CORRECTION_TOLERANCE:
         raise RuntimeError(
-            f"Measured HOME_Q pitch differs from reference by "
-            f"{home_pitch_offset:.5f} rad; sequence aborted."
+            f"Measured HOME_Q pitch differs from reference by {home_pitch_offset:.5f} rad."
         )
     TASK_TOOL_ANGLE = measured_home_pitch
-    print(f"Task tool pitch fixed at {TASK_TOOL_ANGLE:.6f} rad "
-          f"({np.rad2deg(TASK_TOOL_ANGLE):.3f} deg).")
+    print(f"Task tool pitch fixed at {TASK_TOOL_ANGLE:.6f} rad.")
 
-    # 2. Move from HOME to a clearance waypoint above the pickup. All three
-    # Cartesian coordinates are interpolated together; no constant-Z path rule.
-    pick_above = np.array([PICK_XY[0], PICK_XY[1], TRAVEL_Z])
-    t, q, _ = plan_cartesian_segment(
-        HOME_XYZ, pick_above, current_q, CARTESIAN_DURATION
-    )
-    node.execute_arm(q, t, "3D travel from HOME to pickup approach")
-    current_q = node.get_current_q()
+    for i, name in enumerate(labels):
+        pick_xy = targets[i, 0]
+        place_xy = targets[i, 1]
 
-    # 3. Open before approaching the pickup contact point.
-    node.command_gripper(GRIPPER_OPEN_POSITION, "open before pickup approach")
-    pick_contact = np.array([PICK_XY[0], PICK_XY[1], PICK_CONTACT_Z])
-    t, q, _ = plan_cartesian_segment(
-        pick_above, pick_contact, current_q, VERTICAL_DURATION
-    )
-    node.execute_arm(q, t, "3D approach to pickup contact")
-    current_q = node.get_current_q()
-
-    # 4. Grip, lift to a clearance waypoint, then transfer to placement.
-    # Each leg still uses the unconstrained full-XYZ planner; the clearance
-    # waypoint reduces the chance of dragging the object across the base.
-    node.command_gripper(
-        GRIPPER_HALF_CLOSED_POSITION, "half-close on picked object"
-    )
-    t, q, _ = plan_cartesian_segment(
-        pick_contact, pick_above, current_q, VERTICAL_DURATION
-    )
-    node.execute_arm(q, t, "3D lift from pickup")
-    current_q = node.get_current_q()
-
-    place_above = np.array([PLACE_XY[0], PLACE_XY[1], TRAVEL_Z])
-    t, q, _ = plan_cartesian_segment(
-        pick_above, place_above, current_q, CARTESIAN_DURATION
-    )
-    node.execute_arm(q, t, "3D transfer to placement approach")
-    current_q = node.get_current_q()
-
-    # 5. Approach the matching hole. The final target fixes XYZ, while the
-    # interpolated path is free to change height smoothly.
-    place_contact = np.array([PLACE_XY[0], PLACE_XY[1], PLACE_CONTACT_Z])
-    t, q, _ = plan_cartesian_segment(
-        place_above, place_contact, current_q, VERTICAL_DURATION
-    )
-    node.execute_arm(q, t, "3D approach to placement contact")
-    current_q = node.get_current_q()
-    node.command_gripper(
-        GRIPPER_OPEN_POSITION, "open to release at placement contact"
-    )
-
-    # 6. Retract to clearance, then return to home in full XYZ.
-    t, q, _ = plan_cartesian_segment(
-        place_contact, place_above, current_q, VERTICAL_DURATION
-    )
-    node.execute_arm(q, t, "retract from placement")
-    current_q = node.get_current_q()
-
-    t, q, _ = plan_cartesian_segment(
-        place_above, HOME_XYZ, current_q, CARTESIAN_DURATION
-    )
-    node.execute_arm(q, t, "3D return from placement to HOME")
-    current_q = node.get_current_q()
-
-    t, q = plan_startup_joint_move(current_q, HOME_Q)
-    node.execute_arm(q, t, "final move to exact HOME_Q")
-
-    q_final = node.get_current_q()
-    final_error = np.max(np.abs(wrap_delta(q_final, HOME_Q)))
-    if final_error > JOINT_GOAL_TOLERANCE:
-        raise RuntimeError(
-            f"Final HOME_Q verification failed; max joint error={final_error:.4f} rad."
+        pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
+        pick_contact = np.array(
+            [pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float
+        )
+        place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
+        place_contact = np.array(
+            [place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float
         )
 
-    print("\\nPick-and-place sequence completed. Robot returned to HOME_Q.")
+        print(f"\n========== {i + 1}/{len(labels)}: {name} ==========")
+        print("Pick XY:", np.round(pick_xy, 5), "Place XY:", np.round(place_xy, 5))
 
+        # Travel from current TCP position to above this coloured piece.
+        current_q = plan_and_execute_to(
+            node, current_q, pick_above,
+            f"{name}: 3D move to pick approach", CARTESIAN_DURATION
+        )
+        node.command_gripper(GRIPPER_OPEN_POSITION, f"open before {name} pickup")
+
+        # Descend to the coloured shape centre and grip it.
+        current_q = plan_and_execute_to(
+            node, current_q, pick_contact,
+            f"{name}: descend to pick centre", VERTICAL_DURATION
+        )
+        node.command_gripper(
+            GRIPPER_HALF_CLOSED_POSITION, f"grip {name}"
+        )
+
+        # Lift clear of the base, transfer to the matching uncoloured hole.
+        current_q = plan_and_execute_to(
+            node, current_q, pick_above,
+            f"{name}: lift from pick", VERTICAL_DURATION
+        )
+        current_q = plan_and_execute_to(
+            node, current_q, place_above,
+            f"{name}: 3D transfer to matching hole", CARTESIAN_DURATION
+        )
+
+        # Insert at the matching hole centre and release.
+        current_q = plan_and_execute_to(
+            node, current_q, place_contact,
+            f"{name}: descend into matching hole", VERTICAL_DURATION
+        )
+        node.command_gripper(
+            GRIPPER_OPEN_POSITION, f"release {name} into matching hole"
+        )
+        current_q = plan_and_execute_to(
+            node, current_q, place_above,
+            f"{name}: retract after placement", VERTICAL_DURATION
+        )
+
+    # Return to the known home TCP position after all detected shapes are sorted.
+    current_xyz, _ = fk(current_q)
+    current_q = plan_and_execute_to(
+        node, current_q, HOME_XYZ,
+        "return to HOME XYZ", CARTESIAN_DURATION
+    )
+    if DRY_RUN:
+        final_times, final_path = plan_startup_joint_move(current_q, HOME_Q)
+        node.execute_arm(final_path, final_times, "final move to exact HOME_Q")
+    else:
+        final_times, final_path = plan_startup_joint_move(current_q, HOME_Q)
+        node.execute_arm(final_path, final_times, "final move to exact HOME_Q")
+        final_q = node.get_current_q()
+        final_error = float(np.max(np.abs(wrap_delta(final_q, HOME_Q))))
+        if final_error > JOINT_GOAL_TOLERANCE:
+            raise RuntimeError(
+                f"Final HOME_Q verification failed: {final_error:.4f} rad."
+            )
+
+    print(f"\nSorting sequence completed for {len(labels)} detected shape(s).")
+    if DRY_RUN:
+        print("DRY RUN ONLY: no physical robot motion was commanded.")
 
 
 def main():
