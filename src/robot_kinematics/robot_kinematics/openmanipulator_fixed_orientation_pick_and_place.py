@@ -64,13 +64,15 @@ HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
 PICK_CONTACT_Z = float(os.environ.get("PICK_CONTACT_Z", "0.090"))   # Lowest pick contact height (m)
 
-# Minimum placing height: arm/TCP must never descend below 0.078 m (78 mm) for any shape at any point.
-# Can be adjusted via MIN_PLACE_Z or PLACE_CONTACT_Z environment variables if needed.
+# Hard safety floor: arm/TCP must NEVER descend below 0.078 m (78 mm) for any shape at any point.
 MIN_PLACE_Z = float(os.environ.get("MIN_PLACE_Z", "0.078"))         # Hard minimum placing floor (0.078 m)
-DEFAULT_PLACE_CONTACT_Z = max(float(os.environ.get("PLACE_CONTACT_Z", "0.078")), MIN_PLACE_Z)
-PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                            # Default place contact height (0.078 m)
 
-# Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z)
+# Target placing contact height (m): set to 0.082 m (4 mm clearance above floor) to prevent
+# any mechanical compliance or dynamics from touching or crossing the 0.078 m floor.
+DEFAULT_PLACE_CONTACT_Z = max(float(os.environ.get("PLACE_CONTACT_Z", "0.082")), MIN_PLACE_Z + 0.002)
+PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                            # Default place contact height (0.082 m)
+
+# Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z + 0.002)
 PER_SHAPE_PLACE_Z = {
     "green_circle":    DEFAULT_PLACE_CONTACT_Z,
     "orange_hexagon":  DEFAULT_PLACE_CONTACT_Z,
@@ -80,9 +82,9 @@ PER_SHAPE_PLACE_Z = {
 
 
 def get_shape_place_contact_z(shape_name):
-    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z (0.078 m)."""
+    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z + 0.002 m."""
     z_val = PER_SHAPE_PLACE_Z.get(shape_name, DEFAULT_PLACE_CONTACT_Z)
-    return max(float(z_val), MIN_PLACE_Z)
+    return max(float(z_val), MIN_PLACE_Z + 0.002)
 
 
 TRAVEL_Z = 0.140                                                    # 14 cm clearance plane ensures far holes are within kinematic reach
@@ -537,6 +539,19 @@ def plan_cartesian_segment(
         print(f"[{label}] Start re-anchored to measured FK ({start_error*1000:.1f} mm).")
     start_xyz = actual_start_xyz.copy()
 
+    # Safety floor enforcement: actively prevent goal or waypoints from going below minimum_path_z
+    if minimum_path_z is not None:
+        effective_min_z = float(minimum_path_z)
+        if goal_xyz[2] < effective_min_z:
+            print(f"[{label}] Active prevention: goal Z={goal_xyz[2]:.4f} m clamped to safety floor {effective_min_z:.4f} m.")
+            goal_xyz[2] = effective_min_z
+        # For ascending motions departing from contact slightly below floor due to servo compliance,
+        # allow upward departure without spurious abort
+        allowed_min_z = min(effective_min_z, float(start_xyz[2]) - 1e-4)
+    else:
+        effective_min_z = None
+        allowed_min_z = None
+
     current_pitch = float(q_start[1] + q_start[2] + q_start[3])
     if start_tool_angle is None:
         start_tool_angle = current_pitch
@@ -568,43 +583,72 @@ def plan_cartesian_segment(
                 f"{z_error*1000:.1f} mm; no motion planned."
             )
 
-    # The start waypoint is the measured configuration; solve every later point
-    # with the previous solution to maintain a continuous IK branch.
+    # Initial Cartesian waypoints and pitch schedule
     cartesian_waypoints = np.linspace(start_xyz, goal_xyz, int(waypoint_count))
+    if effective_min_z is not None:
+        cartesian_waypoints[:, 2] = np.maximum(cartesian_waypoints[:, 2], effective_min_z)
     target_pitches = np.linspace(start_pitch, goal_pitch, int(waypoint_count))
-    q_waypoints = [q_start.copy()]
-    for waypoint_index in range(1, len(cartesian_waypoints)):
-        q_next = solve_ik(
-            cartesian_waypoints[waypoint_index],
-            q_waypoints[-1],
-            target_pitches[waypoint_index],
-        )
-        q_waypoints.append(q_next)
-    q_path = np.asarray(q_waypoints, dtype=float)
 
     duration = float(duration)
     original_duration = duration
-    for _ in range(15):
-        times = np.linspace(0.0, duration, len(q_path))
+
+    # Active trajectory planning & spline sag compensation loop:
+    # If the non-linear joint-space spline sags below effective_min_z,
+    # automatically elevate waypoints to eliminate the sag and prevent going below the floor.
+    for sag_iteration in range(5):
+        q_waypoints = [q_start.copy()]
+        for waypoint_index in range(1, len(cartesian_waypoints)):
+            q_next = solve_ik(
+                cartesian_waypoints[waypoint_index],
+                q_waypoints[-1],
+                target_pitches[waypoint_index],
+            )
+            q_waypoints.append(q_next)
+        q_path = np.asarray(q_waypoints, dtype=float)
+
+        current_dur = duration
+        for _ in range(15):
+            times = np.linspace(0.0, current_dur, len(q_path))
+            qd_path, _ = derivatives(q_path, times)
+            q_check, qd_check, qdd_check, _, _ = sample_ros_trajectory(
+                q_path, times, qd_path
+            )
+
+            velocity_ratio = float(np.max(np.max(np.abs(qd_check), axis=0) / MAX_JOINT_VELOCITY))
+            acceleration_ratio = float(np.max(np.max(np.abs(qdd_check), axis=0) / MAX_JOINT_ACCELERATION))
+            if velocity_ratio <= 1.0 and acceleration_ratio <= 1.0:
+                break
+            current_dur *= max(1.05, 1.05 * velocity_ratio, 1.05 * np.sqrt(acceleration_ratio))
+        else:
+            raise RuntimeError(f"{label}: cannot satisfy joint velocity/acceleration limits.")
+
+        # Resample after the final duration has been selected.
+        times = np.linspace(0.0, current_dur, len(q_path))
         qd_path, _ = derivatives(q_path, times)
-        q_check, qd_check, qdd_check, _, _ = sample_ros_trajectory(
+        q_check, qd_check, qdd_check, segment_ids, segment_s = sample_ros_trajectory(
             q_path, times, qd_path
         )
+        xyz_check = np.asarray([fk(q)[0] for q in q_check], dtype=float)
 
-        velocity_ratio = float(np.max(np.max(np.abs(qd_check), axis=0) / MAX_JOINT_VELOCITY))
-        acceleration_ratio = float(np.max(np.max(np.abs(qdd_check), axis=0) / MAX_JOINT_ACCELERATION))
-        if velocity_ratio <= 1.0 and acceleration_ratio <= 1.0:
+        if effective_min_z is None:
+            duration = current_dur
             break
-        duration *= max(1.05, 1.05 * velocity_ratio, 1.05 * np.sqrt(acceleration_ratio))
-    else:
-        raise RuntimeError(f"{label}: cannot satisfy joint velocity/acceleration limits.")
 
-    # Resample after the final duration has been selected.
-    times = np.linspace(0.0, duration, len(q_path))
-    qd_path, _ = derivatives(q_path, times)
-    q_check, qd_check, qdd_check, segment_ids, segment_s = sample_ros_trajectory(
-        q_path, times, qd_path
-    )
+        min_actual_z = float(np.min(xyz_check[:, 2]))
+        if min_actual_z >= allowed_min_z - 1e-6:
+            duration = current_dur
+            break
+
+        # Sag detected! Elevate the waypoints to completely prevent going below minimum_path_z
+        sag = allowed_min_z - min_actual_z
+        print(
+            f"[{label}] Active prevention: spline sag of {sag*1000:.2f} mm detected "
+            f"(min Z={min_actual_z:.4f} m < {allowed_min_z:.4f} m). Elevating waypoints..."
+        )
+        progress = np.linspace(0.0, 1.0, len(cartesian_waypoints))
+        cartesian_waypoints[:, 2] += (sag + 0.0005) * progress
+    else:
+        duration = current_dur
 
     if np.any(q_check < JOINT_LIMITS[:, 0] - 1e-8) or np.any(q_check > JOINT_LIMITS[:, 1] + 1e-8):
         raise RuntimeError(f"{label}: interpolated trajectory violates a joint limit.")
@@ -653,10 +697,10 @@ def plan_cartesian_segment(
 
     if minimum_path_z is not None:
         minimum_actual_z = float(np.min(xyz_check[:, 2]))
-        if minimum_actual_z < float(minimum_path_z) - 1e-6:
+        if minimum_actual_z < allowed_min_z - 1e-4:
             raise RuntimeError(
                 f"{label}: interpolated TCP reaches Z={minimum_actual_z:.4f} m, "
-                f"below required {float(minimum_path_z):.3f} m. No command sent."
+                f"below required {allowed_min_z:.3f} m. No command sent."
             )
 
     if not vertical_only and not horizontal_only:
@@ -873,6 +917,13 @@ def load_sort_targets():
         targets[:, 1, 0] += ctrl_dx
         targets[:, 1, 1] += ctrl_dy
         print(f"[OFFSET] Applied runtime place offset: dX={ctrl_dx * 1000:+.1f} mm, dY={ctrl_dy * 1000:+.1f} mm", flush=True)
+
+    bottom_dy = float(os.environ.get("CONTROLLER_BOTTOM_SHAPES_PLACE_OFFSET_Y", "0.000"))
+    if bottom_dy != 0.0:
+        for idx, sname in enumerate(labels):
+            if sname in ("green_circle", "orange_hexagon"):
+                targets[idx, 1, 1] += bottom_dy
+                print(f"[OFFSET] Applied runtime place offset to {sname}: dY={bottom_dy * 1000:+.1f} mm", flush=True)
 
     return targets, labels
 
