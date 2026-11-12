@@ -23,13 +23,15 @@ import time
 from collections import deque
 from itertools import permutations
 
-os.environ.setdefault("QT_X11_NO_MITSHM", "1")   # avoids MIT-SHM BadAccess with Qt-based OpenCV
+os.environ["QT_X11_NO_MITSHM"] = "1"
+os.environ["_X11_NO_MITSHM"] = "1"
+os.environ["GDK_SYNCHRONIZE"] = "1"
 
 import cv2
 import numpy as np
 
 # ---------------------------- CAMERA -----------------------------
-CAMERA_DEVICE = "/dev/video6"
+CAMERA_DEVICE = "/dev/video4"
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 FPS = 30
@@ -243,10 +245,10 @@ MIN_CARDBOARD_FRACTION = 0.02          # strip must cover >= 2% of the frame
 # The cardboard strip is in the central-left task area in the current camera
 # setup. Restricting the search to this region prevents table/floor colours
 # outside the task area from becoming a false cardboard component.
-CARDBOARD_SEARCH_X = (0.30, 0.72)       # current board spans the centre-right of this camera view
+CARDBOARD_SEARCH_X = (0.20, 0.75)       # current board spans the centre of this camera view
 CARDBOARD_SEARCH_Y = (0.00, 1.00)       # fractions of frame height
-CARDBOARD_RECT_ASPECT = (0.12, 0.62)    # short side / long side of the strip
-CARDBOARD_CENTER_X_RANGE = (0.42, 0.60) # expected strip centre, as frame-width fractions
+CARDBOARD_RECT_ASPECT = (0.12, 0.45)    # short side / long side of the strip
+CARDBOARD_CENTER_X_RANGE = (0.30, 0.65) # expected strip centre, as frame-width fractions
 
 # Temporal stabilisation for the board and detected centres.
 BOARD_FRAME_HISTORY = 7          # frames averaged before each board update
@@ -540,11 +542,11 @@ def detect_cardboard(frames, announce=True):
     # ranges accommodate illumination changes without accepting almost every
     # neutral surface in the image.
     ranges = [
-        (np.array((3, 28, 65), np.uint8), np.array((32, 190, 245), np.uint8)),
-        (np.array((3, 35, 45), np.uint8), np.array((32, 220, 235), np.uint8)),
+        (np.array((3, 16, 40), np.uint8), np.array((48, 190, 245), np.uint8)),
+        (np.array((3, 20, 35), np.uint8), np.array((48, 220, 240), np.uint8)),
     ]
     candidates = []
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 25))
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     for lo_broad, hi_broad in ranges:
@@ -628,68 +630,26 @@ def detect_cardboard(frames, announce=True):
     # to this measured colour. This rejects similarly coloured background
     # regions that contaminated the broad first-pass contour.
     med = np.median(hsv[selected_pixels], axis=0)
-    tol = np.array([14, 42, 70], dtype=np.float32)
+    tol = np.array([16, 48, 70], dtype=np.float32)
     lo = np.clip(med.astype(np.float32) - tol, 0, 255).astype(np.uint8)
     hi = np.clip(med.astype(np.float32) + tol, 0, 255).astype(np.uint8)
 
-    tight = cv2.inRange(hsv, lo, hi)
-    tight[:y1, :] = 0
-    tight[y2:, :] = 0
-    tight[:, :x1] = 0
-    tight[:, x2:] = 0
-    tight = cv2.morphologyEx(
-        tight, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-
-    # The cardboard may be broken into several colour components by its four
-    # cut-outs, shadows and printed markings. Combine only components whose
-    # centres lie in the expected cardboard-strip zone. A floor/table patch
-    # elsewhere in the image is not included in the fitted boundary.
-    n_labels, component_labels, stats, centroids = cv2.connectedComponentsWithStats(
-        tight, connectivity=8)
-    point_groups = []
-    for label in range(1, n_labels):
-        comp_area = int(stats[label, cv2.CC_STAT_AREA])
-        cx, cy = centroids[label]
-        cx_fraction = float(cx) / float(w)
-        if comp_area < 50:
-            continue
-        if not (CARDBOARD_CENTER_X_RANGE[0] <= cx_fraction <= CARDBOARD_CENTER_X_RANGE[1]):
-            continue
-        yy, xx = np.where(component_labels == label)
-        if len(xx):
-            point_groups.append(np.column_stack((xx, yy)).astype(np.float32))
-
-    if not point_groups:
-        if announce:
-            print("[CARDBOARD] Broad candidate found, but no matching cardboard-colour "
-                  "components remained after background rejection.", flush=True)
-        return None
-
-    refined_points = np.concatenate(point_groups, axis=0).reshape(-1, 1, 2)
-    refined_rect = cv2.minAreaRect(refined_points)
-    refined_rw, refined_rh = refined_rect[1]
-    refined_aspect = min(refined_rw, refined_rh) / max(refined_rw, refined_rh, 1.0)
-    refined_cx = float(refined_rect[0][0]) / float(w)
-    if (not (CARDBOARD_RECT_ASPECT[0] <= refined_aspect <= CARDBOARD_RECT_ASPECT[1])
-            or not (CARDBOARD_CENTER_X_RANGE[0] <= refined_cx <= CARDBOARD_CENTER_X_RANGE[1])):
-        if announce:
-            print(f"[CARDBOARD] Refined candidate rejected: centre={refined_cx:.2f}, "
-                  f"aspect={refined_aspect:.2f}.", flush=True)
-        return None
-
-    board_polygon = cv2.boxPoints(refined_rect).astype(np.float32)
-    polygon_centre = np.mean(board_polygon, axis=0)
-    board_polygon = polygon_centre + 0.98 * (board_polygon - polygon_centre)
+    # Derive the exact, tight cardboard rectangle directly from the candidate contour.
+    # We do not globally accumulate background connected components, which prevents the
+    # boundary from expanding onto the table or swallowing nearby blocks.
+    rect = cv2.minAreaRect(best)
+    board_polygon = cv2.boxPoints(rect).astype(np.float32)
     board_polygon_i = np.round(board_polygon).astype(np.int32)
     board_mask = np.zeros((h, w), np.uint8)
     cv2.fillConvexPoly(board_mask, board_polygon_i, 255)
     # Inset the hole-search region from the board edge to ensure that the
     # outer table/floor can never be considered a hole.
     hole_search_mask = cv2.erode(
-        board_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)), iterations=1
+        board_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=1
     )
-    exclusion_mask = cv2.dilate(board_mask, np.ones((9, 9), np.uint8), 1)
+    # Exclusion mask is exact board footprint without dilation so blocks sitting
+    # on the table next to the cardboard are never rejected.
+    exclusion_mask = board_mask.copy()
 
     bx, by, bw, bh = cv2.boundingRect(board_polygon_i.reshape(-1, 1, 2))
     pad = 3
@@ -724,10 +684,10 @@ def _rebuild_strip_masks(strip, polygon):
     cv2.fillConvexPoly(board_mask, poly_i, 255)
     hole_search_mask = cv2.erode(
         board_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
         iterations=1,
     )
-    exclusion_mask = cv2.dilate(board_mask, np.ones((9, 9), np.uint8), 1)
+    exclusion_mask = board_mask.copy()
     bx, by, bw, bh = cv2.boundingRect(poly_i)
     pad = 3
     strip["bbox"] = (
@@ -1500,8 +1460,6 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
         lower, upper = COLOR_RANGES[name]
         raw = cv2.inRange(hsv, lower, upper)
         raw = mask_to_roi(raw, roi)
-        if exclude_mask is not None:
-            raw[exclude_mask > 0] = 0
         raw_masks[raw > 0] = DISPLAY_COLOURS[name]
         if name == "green_circle":
             # Preserve smaller green rim segments, then join small lighting gaps.
@@ -1542,6 +1500,19 @@ def find_coloured_objects(frame, roi, exclude_mask=None):
             if x <= roi[0] + 2 or y <= roi[1] + 2 or x + w >= roi[2] - 2 or y + h >= roi[3] - 2:
                 entry["reason"] = "touches ROI edge"
                 continue
+
+            if exclude_mask is not None:
+                cx_c, cy_c = int(round(full_metrics["center"][0])), int(round(full_metrics["center"][1]))
+                if (0 <= cy_c < exclude_mask.shape[0] and 0 <= cx_c < exclude_mask.shape[1]
+                        and exclude_mask[cy_c, cx_c] > 0):
+                    entry["reason"] = "center inside cardboard"
+                    continue
+                c_mask = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(c_mask, [contour], -1, 255, cv2.FILLED)
+                overlap = float(np.count_nonzero(exclude_mask[c_mask > 0])) / max(np.count_nonzero(c_mask), 1)
+                if overlap > 0.40:
+                    entry["reason"] = f"overlaps cardboard ({overlap:.2f} > 0.40)"
+                    continue
 
             # Check colour coverage/hue on the complete silhouette, but use
             # top-face geometry for classification and the robot pick centre.
@@ -1702,7 +1673,7 @@ def find_holes(frame, strip, roi):
     max_area = min(MAX_HOLE_AREA_PX, 0.10 * (roi[2] - roi[0]) * (roi[3] - roi[1]))
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area < MIN_HOLE_AREA_PX or area > max_area:
+        if area < 800 or area > max_area:
             continue
         # Contours are generated only from missing material inside the inset
         # cardboard polygon. Geometry/area tests below reject residual border
@@ -1768,112 +1739,59 @@ def find_holes(frame, strip, roi):
 
     selected = {}
     used_ids = set()
-    reserved_ids = set()
 
-    # Derive the cardboard strip's longitudinal axis from its fitted polygon.
-    board_pts = np.asarray(strip["board_polygon"], dtype=np.float64).reshape(-1, 2)
-    board_centre = np.mean(board_pts, axis=0)
-    centred = board_pts - board_centre
-    covariance = centred.T @ centred
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    long_axis = eigenvectors[:, int(np.argmax(eigenvalues))]
-    # Fix the sign for reproducible diagnostics; distances below are absolute.
-    if long_axis[1] < 0:
-        long_axis = -long_axis
+    # Reject small boundary gaps and keep the 4 largest cutouts
+    valid_candidates = [c for c in candidates if c["area_px"] >= 800]
+    valid_candidates.sort(key=lambda c: c["area_px"], reverse=True)
+    real_holes = valid_candidates[:4]
 
-    def longitudinal_position(candidate):
-        centre = np.asarray(candidate["center_px"], dtype=np.float64)
-        return float(np.dot(centre - board_centre, long_axis))
+    if len(real_holes) == 4:
+        # Derive the cardboard strip's longitudinal axis from its fitted polygon.
+        board_pts = np.asarray(strip["board_polygon"], dtype=np.float64).reshape(-1, 2)
+        board_centre = np.mean(board_pts, axis=0)
+        centred = board_pts - board_centre
+        covariance = centred.T @ centred
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        long_axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+        if long_axis[1] < 0:
+            long_axis = -long_axis
 
-    # 1) Find the unique circle using the circle-specific contour checks.
-    circle_options = [
-        c for c in candidates
-        if c["fits"]["circle"][0]
-        and c["metrics"]["circularity"] >= 0.90
-        and c["metrics"]["ellipse_ratio"] >= CIRCLE_MIN_ELLIPSE_RATIO
-    ]
-    circle_options.sort(key=lambda c: float(c["fits"]["circle"][1]))
-    circle_candidate = circle_options[0] if circle_options else None
-    # Reserve only the winning circle hole so an adjacent rounded hexagon
-    # cut-out is still eligible for the fixed-layout hexagon slot below.
-    if circle_candidate is not None:
-        reserved_ids.add(id(circle_candidate))
+        def longitudinal_position(candidate):
+            centre = np.asarray(candidate["center_px"], dtype=np.float64)
+            return float(np.dot(centre - board_centre, long_axis))
 
-    if circle_candidate is not None:
-        circle_candidate["geometry"] = "circle"
-        circle_candidate["ok"] = True
-        circle_candidate["reason"] = ""
-        circle_candidate["layout_rule"] = "circle end of cardboard strip"
-        selected["green_circle"] = circle_candidate
-        used_ids.add(id(circle_candidate))
+        real_holes.sort(key=longitudinal_position)
 
-        # 2) The nearest distinct hole along the board's long axis is the
-        # hexagon slot. Here the known physical board layout is the deciding
-        # constraint: the hexagonal cut-out is immediately adjacent to the
-        # circular cut-out. Do NOT require a stable six-corner contour, strict
-        # circularity, or a hexagon-template score. The real opening has soft,
-        # rounded edges and can look almost circular/square in this camera view.
-        # The candidate is already constrained to be a sufficiently large
-        # non-cardboard component enclosed by the fitted cardboard footprint.
-        other_candidates = [
-            c for c in candidates
-            if id(c) not in used_ids and id(c) not in reserved_ids
-        ]
-        other_candidates.sort(
-            key=lambda c: abs(longitudinal_position(c) - longitudinal_position(circle_candidate))
-        )
-        adjacent = other_candidates[0] if other_candidates else None
+        # FIXED PHYSICAL BOARD SEQUENCE:
+        # On this manufactured board, the 4 holes in order are ALWAYS:
+        # Circle <-> Hexagon <-> Square <-> Triangle!
+        # The two end holes are real_holes[0] and real_holes[-1].
+        # Determine orientation: Circle has smooth perimeter (high circularity),
+        # Triangle has sharp 3-corner hull and lowest circularity.
+        start_circ = float(real_holes[0]["metrics"]["circularity"])
+        end_circ = float(real_holes[-1]["metrics"]["circularity"])
 
-        if adjacent is not None:
-            reserved_ids.add(id(adjacent))
-            raw_hex_score = float(adjacent["fits"]["hexagon"][1])
-            adjacent["geometry"] = "hexagon"
-            adjacent["ok"] = True
-            adjacent["reason"] = ""
-            adjacent["fits"]["hexagon"] = (
-                True, raw_hex_score,
-                "assigned by fixed board layout: immediately adjacent to circle"
-            )
-            adjacent["layout_rule"] = "immediately adjacent to circle = hexagon"
-            adjacent["metrics"]["layout_hexagon_override"] = True
-            adjacent["metrics"]["hexagon_shape_score_before_layout"] = raw_hex_score
-            selected["orange_hexagon"] = adjacent
-            used_ids.add(id(adjacent))
+        if start_circ > end_circ:
+            ordered_names = ["green_circle", "orange_hexagon", "blue_square", "yellow_triangle"]
         else:
-            pass
+            ordered_names = ["yellow_triangle", "blue_square", "orange_hexagon", "green_circle"]
 
-    # 3) Assign the one remaining square candidate, excluding circle and hexagon.
-    square_options = [
-        c for c in candidates
-        if id(c) not in reserved_ids and id(c) not in used_ids
-        and c["fits"]["square"][0]
-    ]
-    square_options.sort(key=lambda c: float(c["fits"]["square"][1]))
-    if square_options:
-        square_candidate = square_options[0]
-        square_candidate["geometry"] = "square"
-        square_candidate["ok"] = True
-        square_candidate["reason"] = ""
-        square_candidate["layout_rule"] = "remaining square-shaped cardboard opening"
-        selected["blue_square"] = square_candidate
-        used_ids.add(id(square_candidate))
-        reserved_ids.update(id(c) for c in square_options)
-
-    # 4) Assign the one remaining triangle candidate.
-    triangle_options = [
-        c for c in candidates
-        if id(c) not in reserved_ids and id(c) not in used_ids
-        and c["fits"]["triangle"][0]
-    ]
-    triangle_options.sort(key=lambda c: float(c["fits"]["triangle"][1]))
-    if triangle_options:
-        triangle_candidate = triangle_options[0]
-        triangle_candidate["geometry"] = "triangle"
-        triangle_candidate["ok"] = True
-        triangle_candidate["reason"] = ""
-        triangle_candidate["layout_rule"] = "remaining triangular cardboard opening"
-        selected["yellow_triangle"] = triangle_candidate
-        used_ids.add(id(triangle_candidate))
+        for name, hole in zip(ordered_names, real_holes):
+            hole["geometry"] = EXPECTED_GEOMETRY[name]
+            hole["ok"] = True
+            hole["reason"] = ""
+            hole["layout_rule"] = f"fixed physical board sequence: {name}"
+            selected[name] = hole
+            used_ids.add(id(hole))
+    else:
+        # Fallback if fewer than 4 holes meet the area threshold
+        for c in candidates:
+            geom = c.get("geometry", "unknown")
+            for name in SHAPE_ORDER:
+                if EXPECTED_GEOMETRY[name] == geom and name not in selected and id(c) not in used_ids:
+                    selected[name] = c
+                    used_ids.add(id(c))
+                    break
 
     # Reject all extras and guarantee that each physical hole is assigned once.
     for candidate in candidates:
