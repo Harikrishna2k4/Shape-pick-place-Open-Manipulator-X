@@ -62,11 +62,32 @@ TASK_TOOL_ANGLE = float(np.deg2rad(45.0))
 # TCP position recorded for POSE SAMPLE 17 (metres).
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
-PICK_CONTACT_Z = 0.090          # Lowest pick contact height (raised by 3 cm from 0.060 m)
-PLACE_CONTACT_Z = float(os.environ.get("PLACE_CONTACT_Z", "0.100"))  # Lowest place contact height (0.100 m = +4 cm from baseline 0.060 m)
-TRAVEL_Z = 0.140
-PLACE_RETRACT_Z = 0.160          # 16 cm vertical retract after placing
-MIN_TRANSFER_Z = 0.120            # Hard floor for non-contact travel.
+PICK_CONTACT_Z = float(os.environ.get("PICK_CONTACT_Z", "0.090"))   # Lowest pick contact height (m)
+
+# Minimum placing height: arm/TCP must never descend below 0.078 m (78 mm) for any shape at any point.
+# Can be adjusted via MIN_PLACE_Z or PLACE_CONTACT_Z environment variables if needed.
+MIN_PLACE_Z = float(os.environ.get("MIN_PLACE_Z", "0.078"))         # Hard minimum placing floor (0.078 m)
+DEFAULT_PLACE_CONTACT_Z = max(float(os.environ.get("PLACE_CONTACT_Z", "0.078")), MIN_PLACE_Z)
+PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                            # Default place contact height (0.078 m)
+
+# Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z)
+PER_SHAPE_PLACE_Z = {
+    "green_circle":    DEFAULT_PLACE_CONTACT_Z,
+    "orange_hexagon":  DEFAULT_PLACE_CONTACT_Z,
+    "blue_square":     DEFAULT_PLACE_CONTACT_Z,
+    "yellow_triangle": DEFAULT_PLACE_CONTACT_Z,
+}
+
+
+def get_shape_place_contact_z(shape_name):
+    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z (0.078 m)."""
+    z_val = PER_SHAPE_PLACE_Z.get(shape_name, DEFAULT_PLACE_CONTACT_Z)
+    return max(float(z_val), MIN_PLACE_Z)
+
+
+TRAVEL_Z = 0.140                                                    # 14 cm clearance plane ensures far holes are within kinematic reach
+PLACE_RETRACT_Z = 0.160                                             # 16 cm vertical retract after placing
+MIN_TRANSFER_Z = 0.120                                              # Hard floor for non-contact travel.
 
 # Four main phases. Counts include both endpoints of each individual phase.
 # Since adjoining phases share their common endpoint, the unique count is 15.
@@ -894,17 +915,18 @@ def preflight_entire_sequence(targets, labels, start_q):
     for index, name in enumerate(labels):
         pick_xy = targets[index, 0]
         place_xy = targets[index, 1]
+        place_z = get_shape_place_contact_z(name)
         pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
             pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
         place_above_pitch, place_contact_pitch = get_pick_place_pitches(
-            place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+            place_xy, place_z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
 
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
-        place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
+        place_contact = np.array([place_xy[0], place_xy[1], place_z], dtype=float)
 
         print(f"\n[PRE-FLIGHT] {name}: approach to pick height (pitch={np.rad2deg(pick_above_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
@@ -939,10 +961,11 @@ def preflight_entire_sequence(targets, labels, start_q):
             goal_tool_angle=place_above_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: phase 4/4 - descend to place (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)")
+        print(f"[PRE-FLIGHT] {name}: phase 4/4 - descend to place (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg, Z={place_z:.3f} m >= {MIN_PLACE_Z:.3f} m)")
         simulated_q = preflight_plan_segment(
             simulated_q, place_contact, f"{name} place descent", VERTICAL_DURATION,
             PLACE_DESCENT_WAYPOINTS, vertical_only=True,
+            minimum_path_z=MIN_PLACE_Z,
             start_tool_angle=place_above_pitch,
             goal_tool_angle=place_contact_pitch,
         )
@@ -953,6 +976,7 @@ def preflight_entire_sequence(targets, labels, start_q):
         simulated_q = preflight_plan_segment(
             simulated_q, place_retract, f"{name} post-place retract", VERTICAL_DURATION,
             POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
+            minimum_path_z=MIN_PLACE_Z,
             start_tool_angle=place_contact_pitch,
             goal_tool_angle=place_retract_pitch,
         )
@@ -1024,7 +1048,7 @@ def run_sequence(node):
     print("Requested home joints:", np.round(HOME_Q, 5))
     print(f"Home pitch: {HOME_ANGLE:.6f} rad ({np.rad2deg(HOME_ANGLE):.3f} deg)")
     print(f"Task pitch: {TASK_TOOL_ANGLE:.6f} rad (45 degrees)")
-    print(f"Pick contact Z={PICK_CONTACT_Z:.3f} m; place contact Z={PLACE_CONTACT_Z:.3f} m")
+    print(f"Pick contact Z={PICK_CONTACT_Z:.3f} m; place contact Z={PLACE_CONTACT_Z:.3f} m (hard floor: {MIN_PLACE_Z:.3f} m)")
     print(f"Lift and XY transfer height: Z={TRAVEL_Z:.3f} m")
     print("No full 3D orientation lock: only tool pitch is constrained.")
     print("No collision model or safety-rated stop is available in this script.")
@@ -1093,17 +1117,18 @@ def run_sequence(node):
     for index, name in enumerate(labels):
         pick_xy = targets[index, 0]
         place_xy = targets[index, 1]
+        place_z = get_shape_place_contact_z(name)
         pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
             pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
         place_above_pitch, place_contact_pitch = get_pick_place_pitches(
-            place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+            place_xy, place_z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
 
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
-        place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
+        place_contact = np.array([place_xy[0], place_xy[1], place_z], dtype=float)
 
         print(f"\n========== {index + 1}/{len(labels)}: {name} ==========")
         print(
@@ -1158,6 +1183,7 @@ def run_sequence(node):
             node, current_q, place_contact,
             f"{name}: phase 4/4 descend to place", VERTICAL_DURATION,
             PLACE_DESCENT_WAYPOINTS, vertical_only=True,
+            minimum_path_z=MIN_PLACE_Z,
             start_tool_angle=place_above_pitch,
             goal_tool_angle=place_contact_pitch,
         )
@@ -1174,6 +1200,7 @@ def run_sequence(node):
                 node, current_q, place_retract,
                 f"{name}: retract after placement to 16cm", VERTICAL_DURATION,
                 POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
+                minimum_path_z=MIN_PLACE_Z,
                 start_tool_angle=place_contact_pitch,
                 goal_tool_angle=place_retract_pitch,
             )

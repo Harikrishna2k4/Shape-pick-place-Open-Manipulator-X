@@ -81,6 +81,8 @@ def main():
     env = os.environ.copy()
     env["SHAPE_SORT_RUN_DIR"] = str(run_dir)
     env["SHAPE_SORT_TARGETS_FILE"] = str(targets_file)
+    env["QT_X11_NO_MITSHM"] = "1"
+    env["_X11_NO_MITSHM"] = "1"
 
     print(f"Run folder: {run_dir}", flush=True)
     print("STEP 1: Detect the ArUco marker in each camera frame.", flush=True)
