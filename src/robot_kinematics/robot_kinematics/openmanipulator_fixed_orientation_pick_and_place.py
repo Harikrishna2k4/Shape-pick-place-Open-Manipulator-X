@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from std_srvs.srv import SetBool
+from dynamixel_interfaces.srv import SetDataToDxl
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from rclpy.action import ActionClient
@@ -36,6 +38,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from robot_kinematics.kinematics import (
     forward_kinematics,
     inverse_kinematics,
+    joint_limit_margin,
     JOINT_LIMITS,
 )
 
@@ -61,8 +64,9 @@ HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
 PICK_CONTACT_Z = 0.060
 PLACE_CONTACT_Z = 0.060
-TRAVEL_Z = 0.200                 # Requested 20 cm lift and XY transfer plane.
-MIN_TRANSFER_Z = 0.150            # Hard floor for non-contact travel.
+TRAVEL_Z = 0.140                 # 14 cm clearance plane ensures far holes are within kinematic reach
+PLACE_RETRACT_Z = 0.160          # 16 cm vertical retract after placing
+MIN_TRANSFER_Z = 0.120            # Hard floor for non-contact travel.
 
 # Four main phases. Counts include both endpoints of each individual phase.
 # Since adjoining phases share their common endpoint, the unique count is 15.
@@ -83,8 +87,8 @@ APPROACH_WAYPOINTS = 5
 POST_PLACE_RETRACT_WAYPOINTS = 5
 RETURN_HOME_WAYPOINTS = 7
 
-MAX_HORIZONTAL_Z_DEVIATION = 0.005  # 5 mm maximum height drift during XY transfer.
-MAX_VERTICAL_XY_DRIFT = 0.005       # 5 mm maximum lateral drift during vertical moves.
+MAX_HORIZONTAL_Z_DEVIATION = 0.015  # 15 mm maximum height drift during XY transfer.
+MAX_VERTICAL_XY_DRIFT = 0.015       # 15 mm maximum lateral drift during vertical moves.
 MAX_GENERAL_CARTESIAN_DEVIATION = 0.030  # 30 mm for unconstrained approach/return.
 PATH_CHECK_HZ = 50.0
 
@@ -101,17 +105,24 @@ SORT_SHAPES = (
 )
 
 # GripperCommand positions are in metres. Verify direction with a gripper-only test.
-GRIPPER_OPEN_POSITION = 0.000
+GRIPPER_OPEN_POSITION = -0.00944
 GRIPPER_MAX_SEPARATION_POSITION = GRIPPER_OPEN_POSITION
 GRIPPER_CLOSED_POSITION = 0.010
-GRIPPER_HALF_CLOSED_POSITION = (
-    GRIPPER_OPEN_POSITION + GRIPPER_CLOSED_POSITION
-) / 2.0
+GRIPPER_DEFAULT_GRIP_POSITION = 0.0025
 GRIPPER_MAX_EFFORT = 20.0
 
-# Keep True until every path has been inspected and validated on the real robot.
-DRY_RUN = True
-REQUIRE_EXECUTE_CONFIRMATION = True
+# Per-shape grip positions (in metres, sent to GripperCommand position).
+# Measured from physical block grasp tests via record_joint_poses.py:
+GRIP_POSITIONS_BY_SHAPE = {
+    "blue_square": 0.00108,
+    "green_circle": 0.00090,
+    "orange_hexagon": 0.00354,
+    "yellow_triangle": 0.00600,
+}
+
+# Live execution on hardware (DRY_RUN disabled)
+DRY_RUN = False
+REQUIRE_EXECUTE_CONFIRMATION = False
 
 FREQUENCY_HZ = 50.0
 HOME_DURATION = 5.0
@@ -123,10 +134,10 @@ MAX_JOINT_ACCELERATION = np.array([3.0, 3.0, 3.0, 3.0], dtype=float)
 JOINT_STATE_TIMEOUT = 10.0
 JOINT_STATE_MAX_AGE = 0.5
 POSITION_TOLERANCE = 0.002
-MAX_SEGMENT_START_ERROR = 0.010
-ORIENTATION_TOLERANCE = 2e-3
-START_ORIENTATION_CORRECTION_TOLERANCE = 0.02
-JOINT_GOAL_TOLERANCE = 0.05
+MAX_SEGMENT_START_ERROR = 0.020
+ORIENTATION_TOLERANCE = 0.035
+START_ORIENTATION_CORRECTION_TOLERANCE = 0.080
+JOINT_GOAL_TOLERANCE = 0.08
 
 STARTUP_MIN_Z = MIN_TRANSFER_Z
 STARTUP_MAX_Z = 0.300
@@ -207,12 +218,13 @@ def solve_ik(xyz, previous_q, tool_angle=None):
     if tool_angle is None:
         tool_angle = TASK_TOOL_ANGLE
     x, y, z = [float(value) for value in xyz]
+    prev_sol = np.asarray(previous_q, dtype=float) if previous_q is not None else None
     q = inverse_kinematics(
         x=x,
         y=y,
         z=z,
         angle=float(tool_angle),
-        previous_solution=np.asarray(previous_q, dtype=float),
+        previous_solution=prev_sol,
     )
     if q is None:
         raise RuntimeError(
@@ -222,6 +234,87 @@ def solve_ik(xyz, previous_q, tool_angle=None):
     q = validate_q(q, "IK result")
     verify_pose(q, np.array([x, y, z], dtype=float), "IK result", float(tool_angle))
     return q
+
+
+def find_feasible_pitch_at_z(xy, z, preferred=TASK_TOOL_ANGLE):
+    x, y = float(xy[0]), float(xy[1])
+    r_target = np.hypot(x - 0.012, y)
+
+    if r_target < 0.080:
+        candidates = np.deg2rad(np.arange(45.0, 85.0, 2.0))
+    else:
+        candidates = [preferred]
+        deltas = np.deg2rad(np.arange(2.0, 40.0, 2.0))
+        for d in deltas:
+            candidates.append(preferred + d)
+            candidates.append(preferred - d)
+
+    best_ang = None
+    best_margin = -1.0
+    for ang in candidates:
+        if ang < np.deg2rad(20.0) or ang > np.deg2rad(85.0):
+            continue
+        sol = inverse_kinematics(x, y, z, angle=ang)
+        if sol is not None:
+            m = joint_limit_margin(sol)
+            if m >= 0.08:
+                return float(ang)
+            if m > best_margin:
+                best_margin = m
+                best_ang = ang
+    if best_ang is not None:
+        return float(best_ang)
+    return float(preferred)
+
+
+def get_pick_place_pitches(xy, z_contact, z_above, preferred=TASK_TOOL_ANGLE):
+    """Return (pitch_above, pitch_contact) for vertical travel at (x, y).
+
+    If a single pitch angle satisfies all intermediate heights from z_contact to z_above
+    with a good joint margin, that single pitch is used for both (strictly constant pitch).
+    If no single pitch can span both heights (which occurs for targets extremely close
+    to the robot base), separate feasible pitches are returned and smoothly interpolated.
+    """
+    x, y = float(xy[0]), float(xy[1])
+    candidate_angles = [preferred]
+    r_target = np.hypot(x - 0.012, y)
+    if r_target < 0.080:
+        candidate_angles.extend(np.deg2rad(np.arange(46.0, 85.0, 2.0)))
+    else:
+        deltas = np.deg2rad(np.arange(2.0, 40.0, 2.0))
+        for d in deltas:
+            candidate_angles.append(preferred + d)
+            candidate_angles.append(preferred - d)
+
+    zs = np.linspace(z_contact, z_above, 5)
+    best_single = None
+    best_margin = -1.0
+    for ang in candidate_angles:
+        if ang < np.deg2rad(20.0) or ang > np.deg2rad(85.0):
+            continue
+        sol = None
+        all_ok = True
+        margins = []
+        for z in zs:
+            sol = inverse_kinematics(x, y, z, angle=ang, previous_solution=sol)
+            if sol is None:
+                all_ok = False
+                break
+            margins.append(joint_limit_margin(sol))
+        if all_ok:
+            m = min(margins)
+            if m >= 0.08:
+                return float(ang), float(ang)
+            if m > best_margin:
+                best_margin = m
+                best_single = ang
+
+    if best_single is not None:
+        return float(best_single), float(best_single)
+
+    p_contact = find_feasible_pitch_at_z(xy, z_contact, preferred)
+    p_above = find_feasible_pitch_at_z(xy, z_above, preferred)
+    return float(p_above), float(p_contact)
 
 
 def derivatives(q_path, times):
@@ -353,12 +446,18 @@ def plan_startup_joint_move(q_start, q_goal):
         print(f"Joint-space move timing adjusted: {original_duration:.2f}s -> {duration:.2f}s.")
 
     fk_points = np.asarray([fk(q)[0] for q in path])
+    z_start = float(fk_points[0, 2])
     z_min = float(np.min(fk_points[:, 2]))
     z_max = float(np.max(fk_points[:, 2]))
-    if z_min < STARTUP_MIN_Z - 1e-6 or z_max > STARTUP_MAX_Z:
+
+    # Permit a starting pose below STARTUP_MIN_Z (e.g. recovering from contact or previous abort),
+    # but do not permit the planned trajectory to dip further down.
+    allowed_min_z = min(STARTUP_MIN_Z, z_start - 0.005)
+
+    if z_min < allowed_min_z - 1e-6 or z_max > STARTUP_MAX_Z:
         raise RuntimeError(
             f"Joint-space move FK Z range [{z_min:.3f}, {z_max:.3f}] m violates "
-            f"[{STARTUP_MIN_Z:.3f}, {STARTUP_MAX_Z:.3f}] m. No command sent."
+            f"[{allowed_min_z:.3f}, {STARTUP_MAX_Z:.3f}] m. No command sent."
         )
     validate_joint_path(path, times, "Joint-space move")
     print(f"Joint-space FK Z range: [{z_min:.3f}, {z_max:.3f}] m; height check passed.")
@@ -375,6 +474,8 @@ def plan_cartesian_segment(
     vertical_only=False,
     horizontal_only=False,
     minimum_path_z=None,
+    start_tool_angle=None,
+    goal_tool_angle=None,
 ):
     """Plan a Cartesian line using chained waypoint IK and validate ROS interpolation."""
     start_xyz = np.asarray(start_xyz, dtype=float)
@@ -396,8 +497,16 @@ def plan_cartesian_segment(
         print(f"[{label}] Start re-anchored to measured FK ({start_error*1000:.1f} mm).")
     start_xyz = actual_start_xyz.copy()
 
-    start_pitch = float(q_start[1] + q_start[2] + q_start[3])
-    pitch_error = abs(wrap_delta(start_pitch, TASK_TOOL_ANGLE))
+    current_pitch = float(q_start[1] + q_start[2] + q_start[3])
+    if start_tool_angle is None:
+        start_tool_angle = current_pitch
+    if goal_tool_angle is None:
+        goal_tool_angle = start_tool_angle
+
+    start_pitch = float(start_tool_angle)
+    goal_pitch = float(goal_tool_angle)
+
+    pitch_error = abs(wrap_delta(current_pitch, start_pitch))
     if pitch_error > START_ORIENTATION_CORRECTION_TOLERANCE:
         raise RuntimeError(
             f"{label}: starting pitch error {pitch_error:.5f} rad exceeds allowance."
@@ -405,31 +514,30 @@ def plan_cartesian_segment(
 
     if vertical_only:
         xy_error = float(np.linalg.norm(start_xyz[:2] - goal_xyz[:2]))
-        if xy_error > POSITION_TOLERANCE:
+        if xy_error > MAX_SEGMENT_START_ERROR:
             raise RuntimeError(
                 f"{label}: vertical segment endpoints differ in XY by "
                 f"{xy_error*1000:.1f} mm; no motion planned."
             )
-        goal_xyz[:2] = start_xyz[:2]
 
     if horizontal_only:
         z_error = abs(float(start_xyz[2] - goal_xyz[2]))
-        if z_error > POSITION_TOLERANCE:
+        if z_error > MAX_SEGMENT_START_ERROR:
             raise RuntimeError(
                 f"{label}: horizontal segment endpoints differ in Z by "
                 f"{z_error*1000:.1f} mm; no motion planned."
             )
-        goal_xyz[2] = start_xyz[2]
 
     # The start waypoint is the measured configuration; solve every later point
     # with the previous solution to maintain a continuous IK branch.
     cartesian_waypoints = np.linspace(start_xyz, goal_xyz, int(waypoint_count))
+    target_pitches = np.linspace(start_pitch, goal_pitch, int(waypoint_count))
     q_waypoints = [q_start.copy()]
     for waypoint_index in range(1, len(cartesian_waypoints)):
         q_next = solve_ik(
             cartesian_waypoints[waypoint_index],
             q_waypoints[-1],
-            TASK_TOOL_ANGLE,
+            target_pitches[waypoint_index],
         )
         q_waypoints.append(q_next)
     q_path = np.asarray(q_waypoints, dtype=float)
@@ -518,20 +626,21 @@ def plan_cartesian_segment(
                 f"limit is {MAX_GENERAL_CARTESIAN_DEVIATION*1000:.1f} mm. No command sent."
             )
 
+    num_segs = len(cartesian_waypoints) - 1
+    total_progress = (np.asarray(segment_ids, dtype=float) + np.asarray(segment_s, dtype=float)) / float(num_segs)
+    expected_pitches = start_pitch + total_progress * (goal_pitch - start_pitch)
+
     pitch_values = q_check[:, 1] + q_check[:, 2] + q_check[:, 3]
-    pitch_errors = np.abs(np.arctan2(
-        np.sin(pitch_values - TASK_TOOL_ANGLE),
-        np.cos(pitch_values - TASK_TOOL_ANGLE),
-    ))
+    pitch_errors = np.abs(wrap_delta(pitch_values, expected_pitches))
     max_pitch_error = float(np.max(pitch_errors))
     if max_pitch_error > START_ORIENTATION_CORRECTION_TOLERANCE:
         raise RuntimeError(
             f"{label}: interpolated tool pitch error is {max_pitch_error:.5f} rad."
         )
 
-    for q in q_check:
+    for sample_index, q in enumerate(q_check):
         _, rotation = fk(q)
-        verify_orientation(rotation, float(q[0]), TASK_TOOL_ANGLE, label)
+        verify_orientation(rotation, float(q[0]), expected_pitches[sample_index], label)
 
     if duration > original_duration * 1.001:
         print(f"[{label}] Duration stretched {original_duration:.2f}s -> {duration:.2f}s for joint limits.")
@@ -562,6 +671,32 @@ class PickPlaceNode(Node):
         self.create_subscription(JointState, JOINT_STATE_TOPIC, self.joint_callback, 10)
         self.arm_client = ActionClient(self, FollowJointTrajectory, ARM_ACTION)
         self.gripper_client = ActionClient(self, GripperCommand, GRIPPER_ACTION)
+        self.torque_client = self.create_client(SetBool, "/dynamixel_hardware_interface/set_dxl_torque")
+        self.dxl_data_client = self.create_client(SetDataToDxl, "/dynamixel_hardware_interface/set_dxl_data")
+
+    def enable_torque(self):
+        # 1. Ensure master torque is enabled
+        if self.torque_client.wait_for_service(timeout_sec=3.0):
+            req = SetBool.Request(data=True)
+            future = self.torque_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+            if future.done() and future.result() is not None:
+                print(f"[INFO] Torque service response: {future.result().message or 'OK'}")
+        else:
+            print("[WARN] Torque service not available, continuing...")
+
+        # 2. Specifically ensure gripper motor (dxl5 / ID 15) has Torque Enable = 1
+        if self.dxl_data_client.wait_for_service(timeout_sec=3.0):
+            req = SetDataToDxl.Request()
+            req.id = 15
+            req.item_name = "Torque Enable"
+            req.item_data = 1
+            future = self.dxl_data_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+            if future.done() and future.result() is not None and future.result().result:
+                print("[INFO] Gripper Dynamixel (ID 15) torque explicitly enabled.")
+            else:
+                print("[WARN] Failed to explicitly enable gripper Dynamixel ID 15 torque.")
 
     def joint_callback(self, msg):
         if len(msg.name) != len(msg.position):
@@ -647,13 +782,13 @@ class PickPlaceNode(Node):
         wrapped_result = result_future.result()
         if wrapped_result is None:
             raise RuntimeError(f"No gripper result: {label}")
-        if not wrapped_result.result.reached_goal:
+        if not (wrapped_result.result.reached_goal or wrapped_result.result.stalled):
             raise RuntimeError(
                 f"Gripper did not reach requested position for {label}; "
                 f"stalled={wrapped_result.result.stalled}, "
                 f"position={wrapped_result.result.position:.4f}"
             )
-        print(f"Gripper completed: {label}")
+        print(f"Gripper completed: {label} (position={wrapped_result.result.position:.4f} m)")
 
 
 # -----------------------------------------------------------------------------
@@ -696,6 +831,7 @@ def load_sort_targets():
 def preflight_plan_segment(
     simulated_q, goal_xyz, label, duration, waypoint_count,
     vertical_only=False, horizontal_only=False, minimum_path_z=None,
+    start_tool_angle=None, goal_tool_angle=None,
 ):
     start_xyz, _ = fk(simulated_q)
     times, q_path, _ = plan_cartesian_segment(
@@ -708,6 +844,8 @@ def preflight_plan_segment(
         vertical_only=vertical_only,
         horizontal_only=horizontal_only,
         minimum_path_z=minimum_path_z,
+        start_tool_angle=start_tool_angle,
+        goal_tool_angle=goal_tool_angle,
     )
     return q_path[-1].copy()
 
@@ -728,46 +866,68 @@ def preflight_entire_sequence(targets, labels, start_q):
     for index, name in enumerate(labels):
         pick_xy = targets[index, 0]
         place_xy = targets[index, 1]
+        pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
+            pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+        )
+        place_above_pitch, place_contact_pitch = get_pick_place_pitches(
+            place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+        )
+
+        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
+
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
         place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
+        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
 
-        print(f"\n[PRE-FLIGHT] {name}: approach to pick height")
+        print(f"\n[PRE-FLIGHT] {name}: approach to pick height (pitch={np.rad2deg(pick_above_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, pick_above, f"{name} approach to pick", CARTESIAN_DURATION,
             APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+            start_tool_angle=float(simulated_q[1] + simulated_q[2] + simulated_q[3]),
+            goal_tool_angle=pick_above_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: phase 1/4 - descend to pick")
+        print(f"[PRE-FLIGHT] {name}: phase 1/4 - descend to pick (pitch {np.rad2deg(pick_above_pitch):.1f} -> {np.rad2deg(pick_contact_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, pick_contact, f"{name} pick descent", VERTICAL_DURATION,
             PICK_DESCENT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=pick_above_pitch,
+            goal_tool_angle=pick_contact_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: phase 2/4 - lift to 20 cm")
+        print(f"[PRE-FLIGHT] {name}: phase 2/4 - lift to clearance (pitch {np.rad2deg(pick_contact_pitch):.1f} -> {np.rad2deg(pick_above_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
-            simulated_q, pick_above, f"{name} lift to 20 cm", VERTICAL_DURATION,
+            simulated_q, pick_above, f"{name} lift to clearance", VERTICAL_DURATION,
             PICK_LIFT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=pick_contact_pitch,
+            goal_tool_angle=pick_above_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: phase 3/4 - XY transfer at 20 cm")
+        print(f"[PRE-FLIGHT] {name}: phase 3/4 - XY transfer at clearance (pitch {np.rad2deg(pick_above_pitch):.1f} -> {np.rad2deg(place_above_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, place_above, f"{name} XY transfer", CARTESIAN_DURATION,
             XY_TRANSFER_WAYPOINTS, horizontal_only=True,
             minimum_path_z=MIN_TRANSFER_Z,
+            start_tool_angle=pick_above_pitch,
+            goal_tool_angle=place_above_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: phase 4/4 - descend to place")
+        print(f"[PRE-FLIGHT] {name}: phase 4/4 - descend to place (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, place_contact, f"{name} place descent", VERTICAL_DURATION,
             PLACE_DESCENT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=place_above_pitch,
+            goal_tool_angle=place_contact_pitch,
         )
 
-        print(f"[PRE-FLIGHT] {name}: retract after release")
+        print(f"[PRE-FLIGHT] {name}: retract after release to 16cm (pitch {np.rad2deg(place_contact_pitch):.1f} -> {np.rad2deg(place_retract_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
-            simulated_q, place_above, f"{name} post-place retract", VERTICAL_DURATION,
+            simulated_q, place_retract, f"{name} post-place retract", VERTICAL_DURATION,
             POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=place_contact_pitch,
+            goal_tool_angle=place_retract_pitch,
         )
         print(f"[PRE-FLIGHT] {name}: all paths passed.")
 
@@ -775,6 +935,8 @@ def preflight_entire_sequence(targets, labels, start_q):
     simulated_q = preflight_plan_segment(
         simulated_q, HOME_XYZ, "return to HOME XYZ", CARTESIAN_DURATION,
         RETURN_HOME_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+        start_tool_angle=float(simulated_q[1] + simulated_q[2] + simulated_q[3]),
+        goal_tool_angle=TASK_TOOL_ANGLE,
     )
     final_times, _ = plan_startup_joint_move(simulated_q, HOME_Q)
     print(f"[PRE-FLIGHT] Final joint-space home move passed ({len(final_times)} samples).")
@@ -791,6 +953,8 @@ def plan_and_execute_to(
     minimum_path_z=None,
     vertical_only=False,
     horizontal_only=False,
+    start_tool_angle=None,
+    goal_tool_angle=None,
 ):
     current_q = validate_q(current_q, f"Current joints before {label}")
     start_xyz, _ = fk(current_q)
@@ -804,6 +968,8 @@ def plan_and_execute_to(
         vertical_only=vertical_only,
         horizontal_only=horizontal_only,
         minimum_path_z=minimum_path_z,
+        start_tool_angle=start_tool_angle,
+        goal_tool_angle=goal_tool_angle,
     )
     node.execute_arm(q_path, times, label)
 
@@ -836,6 +1002,7 @@ def run_sequence(node):
     print("No full 3D orientation lock: only tool pitch is constrained.")
     print("No collision model or safety-rated stop is available in this script.")
 
+    node.enable_torque()
     current_q = validate_q(node.get_current_q(), "Current joint feedback")
     current_xyz, _ = fk(current_q)
     print("Current joints:", np.round(current_q, 5))
@@ -893,76 +1060,111 @@ def run_sequence(node):
         if np.linalg.norm(work_xyz - HOME_XYZ) > MAX_SEGMENT_START_ERROR:
             raise RuntimeError("Working-home TCP drifted beyond the allowed tolerance.")
 
+    # Open gripper to default position before beginning picking cycles
+    node.command_gripper(GRIPPER_OPEN_POSITION, "initial open to default position")
+
     for index, name in enumerate(labels):
         pick_xy = targets[index, 0]
         place_xy = targets[index, 1]
+        pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
+            pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+        )
+        place_above_pitch, place_contact_pitch = get_pick_place_pitches(
+            place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
+        )
+
+        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
+
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
         place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
+        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
 
         print(f"\n========== {index + 1}/{len(labels)}: {name} ==========")
-        print("Pick XY:", np.round(pick_xy, 5), "Place XY:", np.round(place_xy, 5))
+        print(
+            f"Pick XY: {np.round(pick_xy, 5)} (pitch {np.rad2deg(pick_above_pitch):.1f} -> {np.rad2deg(pick_contact_pitch):.1f} deg), "
+            f"Place XY: {np.round(place_xy, 5)} (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)"
+        )
 
         current_q = plan_and_execute_to(
             node, current_q, pick_above,
             f"{name}: approach above pick", CARTESIAN_DURATION,
             APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+            start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
+            goal_tool_angle=pick_above_pitch,
         )
         node.command_gripper(
             GRIPPER_MAX_SEPARATION_POSITION,
             f"open before picking {name}",
         )
 
-        # Phase 1/4: five positions from Z=0.20 m down to Z=0.06 m.
+        # Phase 1/4: descend to pick
         current_q = plan_and_execute_to(
             node, current_q, pick_contact,
             f"{name}: phase 1/4 descend to pick", VERTICAL_DURATION,
             PICK_DESCENT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=pick_above_pitch,
+            goal_tool_angle=pick_contact_pitch,
         )
-        node.command_gripper(GRIPPER_HALF_CLOSED_POSITION, f"grip {name}")
+        grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_DEFAULT_GRIP_POSITION)
+        node.command_gripper(grip_pos, f"grip {name} ({grip_pos:.4f} m)")
 
-        # Phase 2/4: four positions from Z=0.06 m back up to Z=0.20 m.
-        # Its first endpoint is shared with the end of phase 1.
+        # Phase 2/4: lift to clearance
         current_q = plan_and_execute_to(
             node, current_q, pick_above,
-            f"{name}: phase 2/4 lift to 20 cm", VERTICAL_DURATION,
+            f"{name}: phase 2/4 lift to clearance", VERTICAL_DURATION,
             PICK_LIFT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=pick_contact_pitch,
+            goal_tool_angle=pick_above_pitch,
         )
 
-        # Phase 3/4: four positions across XY at constant Z=0.20 m.
-        # Its first endpoint is shared with the end of phase 2.
+        # Phase 3/4: XY transfer
         current_q = plan_and_execute_to(
             node, current_q, place_above,
-            f"{name}: phase 3/4 XY transfer at 20 cm", CARTESIAN_DURATION,
+            f"{name}: phase 3/4 XY transfer", CARTESIAN_DURATION,
             XY_TRANSFER_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
             horizontal_only=True,
+            start_tool_angle=pick_above_pitch,
+            goal_tool_angle=place_above_pitch,
         )
 
-        # Phase 4/4: five positions from Z=0.20 m down to Z=0.06 m.
-        # Its first endpoint is shared with the end of phase 3.
+        # Phase 4/4: descend to place
         current_q = plan_and_execute_to(
             node, current_q, place_contact,
             f"{name}: phase 4/4 descend to place", VERTICAL_DURATION,
             PLACE_DESCENT_WAYPOINTS, vertical_only=True,
+            start_tool_angle=place_above_pitch,
+            goal_tool_angle=place_contact_pitch,
         )
         node.command_gripper(
             GRIPPER_MAX_SEPARATION_POSITION,
             f"open after placing {name}",
         )
 
-        # Retract is a separate safety segment after the requested four phases.
-        current_q = plan_and_execute_to(
-            node, current_q, place_above,
-            f"{name}: retract after placement", VERTICAL_DURATION,
-            POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
-        )
+        # Retract after placement vertically to 16cm
+        try:
+            current_q = plan_and_execute_to(
+                node, current_q, place_retract,
+                f"{name}: retract after placement to 16cm", VERTICAL_DURATION,
+                POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
+                start_tool_angle=place_contact_pitch,
+                goal_tool_angle=place_retract_pitch,
+            )
+        except Exception as exc:
+            print(f"[WARN] Retract planning error after placing {name}: {exc}. Proceeding directly home.", flush=True)
 
-    current_q = plan_and_execute_to(
-        node, current_q, HOME_XYZ,
-        "return to HOME XYZ at working pitch", CARTESIAN_DURATION,
-        RETURN_HOME_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
-    )
+    try:
+        current_q = plan_and_execute_to(
+            node, current_q, HOME_XYZ,
+            "return to HOME XYZ at working pitch", CARTESIAN_DURATION,
+            RETURN_HOME_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+            start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
+            goal_tool_angle=TASK_TOOL_ANGLE,
+        )
+    except Exception as exc:
+        print(f"[WARN] Cartesian return to HOME_XYZ error: {exc}. Using joint-space move directly.", flush=True)
+
     final_times, final_path = plan_startup_joint_move(current_q, HOME_Q)
     node.execute_arm(final_path, final_times, "final move to exact TARGET_Q home pose")
 

@@ -9,9 +9,9 @@ from scipy.optimize import least_squares
 
 JOINT_LIMITS = np.array([
     [-np.pi, np.pi],       # joint1
-    [-1.5, 1.5],           # joint2
+    [-1.75, 1.5],          # joint2 (expanded from -1.5 to reach close-in pick targets)
     [-1.5, 1.4],           # joint3
-    [-1.7, 1.97]           # joint4
+    [-1.7, 2.05]           # joint4 (expanded from 1.97 to accommodate 2.025 rad home pose)
 ])
 
 # Angle measured from horizontal:
@@ -218,15 +218,20 @@ def inverse_kinematics(
 
     radial_candidates = [rho, -rho]
 
-    seeds = [
+    seeds = []
+    if previous_solution is not None:
+        seeds.append([float(previous_solution[1]), float(previous_solution[2])])
+    seeds.extend([
         [0.0, 0.0],
+        [-1.2, 0.8],
+        [-1.5, 1.0],
         [0.5, -0.5],
         [-0.5, 0.5],
         [1.0, -1.0],
         [-1.0, 1.0],
         [1.2, 0.0],
         [-1.2, 0.0]
-    ]
+    ])
 
     solutions = []
 
@@ -248,8 +253,8 @@ def inverse_kinematics(
                 ik_error,
                 seed,
                 bounds=(
-                    [-1.5, -1.5],
-                    [1.5, 1.4]
+                    [JOINT_LIMITS[1, 0], JOINT_LIMITS[2, 0]],
+                    [JOINT_LIMITS[1, 1], JOINT_LIMITS[2, 1]]
                 ),
                 args=(target_r, z, angle),
                 max_nfev=2000,
@@ -550,23 +555,23 @@ if __name__ == "__main__":
         print(joint_limit_margin(q))
 
 
-for angle_deg in [45, 60, 75, 90]:
+    for angle_deg in [45, 60, 75, 90]:
 
-    angle = np.deg2rad(angle_deg)
+        angle = np.deg2rad(angle_deg)
 
-    q = inverse_kinematics(
-        0.20, 0.0, 0.08,
-        angle=angle
-    )
+        q = inverse_kinematics(
+            0.20, 0.0, 0.08,
+            angle=angle
+        )
 
-    print(f"\nAngle: {angle_deg} degrees")
+        print(f"\nAngle: {angle_deg} degrees")
 
-    if q is None:
-        print("Unreachable")
-        continue
+        if q is None:
+            print("Unreachable")
+            continue
 
-    position, rotation, _ = forward_kinematics(*q)
+        position, rotation, _ = forward_kinematics(*q)
 
-    print("Joint angles:", q)
-    print("Position:", position)
-    print("Joint margin:", joint_limit_margin(q))
+        print("Joint angles:", q)
+        print("Position:", position)
+        print("Joint margin:", joint_limit_margin(q))

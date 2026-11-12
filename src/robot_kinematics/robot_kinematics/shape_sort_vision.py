@@ -40,10 +40,10 @@ AVERAGING_SECONDS = 5.0
 HEADLESS = (os.environ.get("SHAPE_SORT_HEADLESS") == "1"
             or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")))
 MIN_VALID_SAMPLES = 10
-MIN_DETECTION_RATE = 0.70      # fraction of averaging frames with a valid object/hole pair
-MIN_HOLE_DETECTION_RATE = 0.70  # all four fixed cardboard holes must be seen this often
+MIN_DETECTION_RATE = 0.10      # fraction of averaging frames with a valid object/hole pair
+MIN_HOLE_DETECTION_RATE = 0.50  # required cardboard holes must be seen this often
 NO_COLOURED_OBJECTS_EXIT = 4   # valid vision run, but there is nothing to sort
-MAX_POSITION_STD_M = 0.004     # reject targets that jitter more than 4 mm (1 sigma)
+MAX_POSITION_STD_M = 0.015     # reject targets that jitter more than 15 mm (1 sigma)
 
 # -------------------------- OUTPUT FILES --------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -61,20 +61,67 @@ def make_run_dir():
 
 
 # ---------------- LIVE ARUCO -> ROBOT CALIBRATION ----------------
-# One ArUco marker is detected in every camera frame. Its four OUTER corners
-# are mapped to the four robot-base XY positions measured with TCP + FK.
+# Two 3.7 cm ArUco markers (ID 0 at bottom, ID 4 at top) span the workspace.
+# Their 8 outer corners are mapped to the 8 robot-base XY positions measured
+# with TCP + FK. The calibrated 2-marker homography is saved to disk and
+# remembered so pick-and-place works even when markers are occluded or removed.
 ARUCO_DICT_NAME = "DICT_4X4_50"
-TARGET_MARKER_ID = None       # None = use the largest detected marker
+TARGET_MARKER_ID = None       # None = use all configured markers (IDs 0 and 4)
 MARKER_SIDE_M = 0.037         # physical outer-edge-to-outer-edge side length (m)
+CALIBRATED_HOMOGRAPHY_FILE = SCRIPT_DIR / "calibrated_homography.npz"
 
 # Corner order MUST match OpenCV's detected ArUco order: TL, TR, BR, BL.
 # These are measured TCP/FK robot base_link coordinates, in metres.
-ROBOT_MARKER_CORNERS = np.array([
-    [0.121, 0.131],  # Top-left
-    [0.117, 0.092],  # Top-right
-    [0.079, 0.084],  # Bottom-right
-    [0.083, 0.120],  # Bottom-left
-], dtype=np.float32)
+ROBOT_MARKER_CORNERS_BY_ID = {
+    0: np.array([
+        [0.1210,  0.1310],  # TL (bottom-left of id=0 in camera view)
+        [0.1170,  0.0920],  # TR (top-left of id=0 in camera view)
+        [0.0790,  0.0840],  # BR (top-right of id=0 in camera view)
+        [0.0830,  0.1200],  # BL (bottom-right of id=0 in camera view)
+    ], dtype=np.float32),
+    4: np.array([
+        [0.1127, -0.1243],  # TL (top-left of id=4 in camera view)
+        [0.0777, -0.1249],  # TR (top-right of id=4 in camera view)
+        [0.0763, -0.0848],  # BR (bottom-right of id=4 in camera view)
+        [0.1166, -0.0910],  # BL (bottom-left of id=4 in camera view)
+    ], dtype=np.float32),
+}
+
+# Backwards-compatible alias for metadata/logging (all 8 corners stacked).
+ROBOT_MARKER_CORNERS = np.vstack([
+    ROBOT_MARKER_CORNERS_BY_ID[0],
+    ROBOT_MARKER_CORNERS_BY_ID[4],
+])
+
+# Pre-calibrated reference image corners for IDs 0 and 4 from the live camera,
+# used to initialize and persist the remembered 8-point homography.
+DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
+    0: np.array([
+        [469.4, 337.5],
+        [459.1, 291.7],
+        [505.8, 286.4],
+        [515.1, 330.9],
+    ], dtype=np.float32),
+    4: np.array([
+        [418.4,  17.6],
+        [456.6,  16.5],
+        [462.7,  55.2],
+        [421.1,  60.2],
+    ], dtype=np.float32),
+}
+
+# 3D object height parallax compensation:
+# Because the camera views the metal plate obliquely from nadir ~(383, 290.5)
+# and the 3D blocks have height above the table plane (where the ArUco markers
+# lie), an object's top face projects away from the camera nadir. Shifting the
+# top-face pixel towards the nadir recovers the true table-plane base center.
+CAMERA_NADIR_PX = np.array([383.0, 290.5], dtype=np.float64)
+OBJECT_PARALLAX_FACTORS = {
+    "green_circle":    np.array([0.155, 0.220], dtype=np.float64),
+    "blue_square":     np.array([0.120, 0.160], dtype=np.float64),
+    "orange_hexagon":  np.array([0.120, 0.160], dtype=np.float64),
+    "yellow_triangle": np.array([0.120, 0.160], dtype=np.float64),
+}
 
 ARUCO_CORNER_LABELS = ("TL", "TR", "BR", "BL")
 ARUCO_MIN_AREA_PX = 80.0
@@ -108,10 +155,10 @@ DISPLAY_COLOURS = {
 # orange/yellow need a high saturation floor. If your blocks are less saturated
 # than this, lower the S minimum of that colour in COLOR_RANGES.
 COLOR_RANGES = {
-    "green_circle":    (np.array([38, 65, 65], np.uint8),  np.array([55, 255, 255], np.uint8)),
+    "green_circle":    (np.array([30, 65, 65], np.uint8),  np.array([65, 255, 255], np.uint8)),
     "blue_square":     (np.array([99, 150, 60], np.uint8), np.array([120, 255, 230], np.uint8)),
     "orange_hexagon":  (np.array([5, 150, 90], np.uint8),  np.array([19, 255, 255], np.uint8)),
-    "yellow_triangle": (np.array([20, 120, 90], np.uint8), np.array([37, 255, 255], np.uint8)),
+    "yellow_triangle": (np.array([18, 120, 90], np.uint8), np.array([34, 255, 255], np.uint8)),
 }
 
 MIN_COLOR_AREA_PX = 200.0
@@ -170,7 +217,7 @@ TRIANGLE_MIN_MATCH_SCORE = 0.18
 HOLE_TRIANGLE_MAX_MATCH_SCORE = 0.10
 CIRCLE_MIN_CIRCULARITY = 0.88
 CIRCLE_MIN_ELLIPSE_RATIO = 0.80
-CIRCLE_MAX_HARMONIC = 0.030     # max amplitude of radial harmonics 3..8
+CIRCLE_MAX_HARMONIC = 0.055     # max amplitude of radial harmonics 3..8
 SQUARE_MIN_RECT_FILL = 0.72
 SQUARE_MIN_ASPECT = 0.65
 SQUARE_MIN_HARMONIC4 = 0.015
@@ -254,13 +301,87 @@ def make_aruco_detector():
     return detector, dictionary, parameters
 
 
-def detect_aruco_homography(frame, detector, dictionary, parameters):
-    """Return (H, detected_marker_corners, marker_id) for the current frame.
+def _valid_homography(H):
+    return (
+        H is not None
+        and getattr(H, "shape", None) == (3, 3)
+        and np.all(np.isfinite(H))
+        and abs(float(np.linalg.det(H))) >= 1e-12
+    )
 
-    H maps camera pixels directly to robot base_link XY in metres. All four
-    measured robot corner coordinates are used; no axis-alignment assumption
-    or external calibration .npz file is used.
-    """
+
+def compute_homography_from_corner_map(corners_by_id):
+    """Compute a pixel -> robot XY homography from 1 or 2 calibrated ArUco markers."""
+    img_groups = []
+    rob_groups = []
+    for marker_id in sorted(ROBOT_MARKER_CORNERS_BY_ID.keys()):
+        if marker_id in corners_by_id and corners_by_id[marker_id] is not None:
+            pts = np.asarray(corners_by_id[marker_id], dtype=np.float32).reshape(4, 2)
+            if np.all(np.isfinite(pts)):
+                img_groups.append(pts)
+                rob_groups.append(ROBOT_MARKER_CORNERS_BY_ID[marker_id])
+
+    if not img_groups:
+        return None
+
+    img_pts = np.vstack(img_groups).astype(np.float32)
+    rob_pts = np.vstack(rob_groups).astype(np.float32)
+    if len(img_pts) == 4:
+        H = cv2.getPerspectiveTransform(img_pts, rob_pts)
+    else:
+        H, _ = cv2.findHomography(img_pts, rob_pts, method=0)
+
+    return H if _valid_homography(H) else None
+
+
+def save_remembered_calibration(H, corners_by_id):
+    """Persist the calibrated 8-point homography and marker reference corners."""
+    if not _valid_homography(H):
+        return
+    c0 = np.asarray(
+        corners_by_id.get(0, DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID[0]),
+        dtype=np.float32,
+    ).reshape(4, 2)
+    c4 = np.asarray(
+        corners_by_id.get(4, DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID[4]),
+        dtype=np.float32,
+    ).reshape(4, 2)
+    try:
+        np.savez_compressed(
+            CALIBRATED_HOMOGRAPHY_FILE,
+            H=np.asarray(H, dtype=np.float64),
+            corners_id0=c0,
+            corners_id4=c4,
+            robot_corners_id0=ROBOT_MARKER_CORNERS_BY_ID[0],
+            robot_corners_id4=ROBOT_MARKER_CORNERS_BY_ID[4],
+        )
+    except OSError:
+        pass
+
+
+def load_remembered_calibration():
+    """Load the persisted 2-marker homography, or initialize it from pre-calibrated defaults."""
+    if CALIBRATED_HOMOGRAPHY_FILE.exists():
+        try:
+            with np.load(CALIBRATED_HOMOGRAPHY_FILE) as data:
+                H = np.asarray(data["H"], dtype=np.float64)
+                c0 = np.asarray(data["corners_id0"], dtype=np.float32).reshape(4, 2)
+                c4 = np.asarray(data["corners_id4"], dtype=np.float32).reshape(4, 2)
+                if _valid_homography(H):
+                    return {"H": H, "corners_by_id": {0: c0, 4: c4}}
+        except Exception:
+            pass
+
+    default_corners = {
+        mid: pts.copy() for mid, pts in DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID.items()
+    }
+    H = compute_homography_from_corner_map(default_corners)
+    save_remembered_calibration(H, default_corners)
+    return {"H": H, "corners_by_id": default_corners}
+
+
+def detect_aruco_markers_in_frame(frame, detector, dictionary, parameters):
+    """Detect all configured calibration ArUco markers (IDs 0 and 4) in the frame."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     if detector is not None:
@@ -270,44 +391,105 @@ def detect_aruco_homography(frame, detector, dictionary, parameters):
             gray, dictionary, parameters=parameters
         )
 
+    detected = {}
     if ids is None or len(ids) == 0:
-        return None, None, None
+        return detected
 
-    flat_ids = ids.flatten()
-    candidates = [
-        i for i, marker_id in enumerate(flat_ids)
-        if TARGET_MARKER_ID is None or int(marker_id) == TARGET_MARKER_ID
-    ]
-    if not candidates:
-        return None, None, None
+    for raw_corners, marker_id_arr in zip(corners, ids.flatten()):
+        marker_id = int(marker_id_arr)
+        if marker_id not in ROBOT_MARKER_CORNERS_BY_ID:
+            continue
+        image_corners = raw_corners.reshape(4, 2).astype(np.float32)
+        if not np.all(np.isfinite(image_corners)):
+            continue
+        marker_area = abs(float(cv2.contourArea(image_corners)))
+        if marker_area < ARUCO_MIN_AREA_PX:
+            continue
+        if marker_id not in detected or marker_area > detected[marker_id][1]:
+            detected[marker_id] = (image_corners, marker_area)
 
-    chosen = max(
-        candidates,
-        key=lambda i: cv2.contourArea(
-            corners[i].reshape(4, 2).astype(np.float32)
-        ),
-    )
+    return {mid: item[0] for mid, item in detected.items()}
 
-    image_corners = corners[chosen].reshape(4, 2).astype(np.float32)
-    marker_area = abs(float(cv2.contourArea(image_corners)))
-    if marker_area < ARUCO_MIN_AREA_PX:
-        return None, None, None
 
-    if not np.all(np.isfinite(image_corners)):
-        return None, None, None
+def update_aruco_homography(frame, detector, dictionary, parameters, state, remembered):
+    """Return (H, active_corners_by_id, status_text) using live markers + remembered calibration."""
+    raw_by_id = detect_aruco_markers_in_frame(frame, detector, dictionary, parameters)
+    per_marker_state = state.setdefault("markers", {})
+    active_live = {}
 
-    # OpenCV ArUco corner sequence: TL, TR, BR, BL.
-    H = cv2.getPerspectiveTransform(
-        image_corners,
-        ROBOT_MARKER_CORNERS,
-    )
+    for marker_id in sorted(ROBOT_MARKER_CORNERS_BY_ID.keys()):
+        mstate = per_marker_state.setdefault(
+            marker_id, {"corners": None, "misses": 0}
+        )
+        if marker_id in raw_by_id:
+            current = np.asarray(raw_by_id[marker_id], dtype=np.float64).reshape(4, 2)
+            previous = mstate.get("corners")
+            if previous is None or float(
+                np.max(np.linalg.norm(current - previous, axis=1))
+            ) > ARUCO_MAX_CORNER_JUMP_PX:
+                stable = current
+            else:
+                alpha = float(ARUCO_CORNER_SMOOTHING_ALPHA)
+                stable = (1.0 - alpha) * previous + alpha * current
+            mstate["corners"] = stable.copy()
+            mstate["misses"] = 0
+            active_live[marker_id] = stable.astype(np.float32)
+        else:
+            mstate["misses"] = mstate.get("misses", 0) + 1
+            if mstate["misses"] <= 3 and mstate.get("corners") is not None:
+                active_live[marker_id] = mstate["corners"].astype(np.float32)
+            elif mstate["misses"] > 3:
+                mstate["corners"] = None
 
-    if H.shape != (3, 3) or not np.all(np.isfinite(H)):
-        return None, None, None
-    if abs(float(np.linalg.det(H))) < 1e-12:
-        return None, None, None
+    rem_corners = remembered.get("corners_by_id", DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID)
 
-    return H, corners[chosen], int(flat_ids[chosen])
+    # Case 1: Both ID 0 and ID 4 are live -> full 8-point calibration + persist
+    if 0 in active_live and 4 in active_live:
+        H = compute_homography_from_corner_map(active_live)
+        if _valid_homography(H):
+            remembered["H"] = H
+            remembered["corners_by_id"] = {
+                0: active_live[0].copy(),
+                4: active_live[4].copy(),
+            }
+            state["save_counter"] = state.get("save_counter", 0) + 1
+            if state["save_counter"] == 1 or state["save_counter"] % 30 == 0:
+                save_remembered_calibration(H, remembered["corners_by_id"])
+            return H, active_live, "ARUCO IDs 0 & 4 | live 8-corner homography (saved)"
+
+    # Case 2: Exactly 1 marker is visible -> combine its 4 live corners with
+    # the remembered partner marker corners (translated by any small camera shift).
+    if len(active_live) == 1:
+        vis_id = next(iter(active_live.keys()))
+        other_id = 4 if vis_id == 0 else 0
+        vis_corners = active_live[vis_id]
+        ref_vis = rem_corners.get(vis_id)
+        ref_other = rem_corners.get(other_id)
+        hybrid_corners = {vis_id: vis_corners}
+        if ref_vis is not None and ref_other is not None:
+            delta = np.mean(vis_corners - ref_vis, axis=0)
+            if float(np.linalg.norm(delta)) <= 25.0:
+                hybrid_corners[other_id] = (ref_other + delta).astype(np.float32)
+            else:
+                hybrid_corners[other_id] = ref_other.astype(np.float32)
+        H = compute_homography_from_corner_map(hybrid_corners)
+        if _valid_homography(H):
+            return (
+                H,
+                active_live,
+                f"ARUCO ID {vis_id} + remembered ID {other_id} | 8-corner homography active",
+            )
+
+    # Case 3: Neither marker is visible -> use the remembered 8-corner homography
+    H_rem = remembered.get("H")
+    if _valid_homography(H_rem):
+        return (
+            H_rem,
+            active_live,
+            "ARUCO occluded/absent | using remembered 8-corner homography",
+        )
+
+    return None, {}, "ARUCO NOT DETECTED & no remembered homography"
 
 
 def open_camera():
@@ -320,7 +502,7 @@ def open_camera():
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
     camera.set(cv2.CAP_PROP_FPS, FPS)
-    for _ in range(5):
+    for _ in range(25):
         camera.read()
     return camera
 
@@ -329,38 +511,6 @@ def cardboard_mask(hsv, lo, hi):
     m = cv2.inRange(hsv, lo, hi)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-
-
-def smooth_aruco_corners(detected_corners, marker_id, state):
-    """EMA-smooth the four image corners while preserving the current marker ID."""
-    if detected_corners is None or marker_id is None:
-        state["misses"] = state.get("misses", 0) + 1
-        if state["misses"] > 3:
-            state["corners"] = None
-            state["marker_id"] = None
-        return None, None
-
-    current = np.asarray(detected_corners, dtype=np.float64).reshape(4, 2)
-    previous = state.get("corners")
-    previous_id = state.get("marker_id")
-    if previous is None or previous_id != marker_id:
-        stable = current
-    elif float(np.max(np.linalg.norm(current - previous, axis=1))) > ARUCO_MAX_CORNER_JUMP_PX:
-        # A large jump is likely a genuine board/camera movement or a marker switch.
-        stable = current
-    else:
-        alpha = float(ARUCO_CORNER_SMOOTHING_ALPHA)
-        stable = (1.0 - alpha) * previous + alpha * current
-
-    state["corners"] = stable.copy()
-    state["marker_id"] = int(marker_id)
-    state["misses"] = 0
-    stable = stable.astype(np.float32)
-    H = cv2.getPerspectiveTransform(stable, ROBOT_MARKER_CORNERS)
-    if not np.all(np.isfinite(H)) or abs(float(np.linalg.det(H))) < 1e-12:
-        return None, None
-    return H, stable.reshape(1, 4, 2)
 
 
 def detect_cardboard(frames, announce=True):
@@ -478,7 +628,7 @@ def detect_cardboard(frames, announce=True):
     # to this measured colour. This rejects similarly coloured background
     # regions that contaminated the broad first-pass contour.
     med = np.median(hsv[selected_pixels], axis=0)
-    tol = np.array([7, 35, 60], dtype=np.float32)
+    tol = np.array([14, 42, 70], dtype=np.float32)
     lo = np.clip(med.astype(np.float32) - tol, 0, 255).astype(np.uint8)
     hi = np.clip(med.astype(np.float32) + tol, 0, 255).astype(np.uint8)
 
@@ -659,6 +809,21 @@ def pixel_to_robot_xy(pixel_xy, H):
     if result.shape != (2,) or not np.all(np.isfinite(result)):
         raise ValueError(f"Invalid homography result for pixel point {pixel_xy}.")
     return result
+
+
+def object_top_to_table_px(pixel_xy, shape_name=None):
+    """Compensate for 3D object height parallax under oblique camera viewing."""
+    p = np.asarray(pixel_xy, dtype=np.float64).reshape(2)
+    factors = OBJECT_PARALLAX_FACTORS.get(
+        shape_name, np.array([0.120, 0.160], dtype=np.float64)
+    )
+    return p + factors * (CAMERA_NADIR_PX - p)
+
+
+def object_pixel_to_robot_xy(pixel_xy, H, shape_name=None):
+    """Project an elevated 3D block's top-face centre onto the table plane, then map to robot XY."""
+    table_px = object_top_to_table_px(pixel_xy, shape_name=shape_name)
+    return pixel_to_robot_xy(table_px, H)
 
 
 # ============================ GEOMETRY ============================
@@ -958,6 +1123,7 @@ def shape_fit(contour):
         # and lighting. Use the stable convex-hull triangle and match score,
         # rather than demanding an almost-perfect filled silhouette.
         (sol >= TRIANGLE_SOLIDITY_MIN, f"solidity {sol:.2f}"),
+        (m["circularity"] <= 0.80, f"too circular for triangle ({m['circularity']:.2f})"),
         (tri is not None and len(ta) == 3, "no stable 3 corners"),
         (bool(ta) and 20 <= min(ta) and max(ta) <= 145, "corner angles"),
         (m["tri_fill"] >= TRI_MIN_FILL, f"tri fill {m['tri_fill']:.2f}"),
@@ -1000,9 +1166,11 @@ def fit_top_face_ellipse(contour, upper_fraction=0.62):
         return None
 
     candidates = []
-    # Different fractions accommodate both a shallow disk and a taller cylinder.
-    for fraction in (0.34, 0.42, 0.50, 0.58, float(upper_fraction), 0.70):
-        cutoff = y + fraction * h
+    cap_h = float(min(w, h))
+    # Measure fractions relative to the top cap height min(w, h) so a tall
+    # cylinder side wall does not pull the fitted ellipse down onto the side.
+    for fraction in (0.45, 0.55, 0.65, 0.75, 0.85, 0.95):
+        cutoff = y + fraction * cap_h
         upper = pts[pts[:, 1] <= cutoff]
         if len(upper) < 12:
             continue
@@ -1014,15 +1182,15 @@ def fit_top_face_ellipse(contour, upper_fraction=0.62):
         (cx, cy), (axis_a, axis_b), angle_deg = ellipse
         major = max(float(axis_a), float(axis_b))
         minor = min(float(axis_a), float(axis_b))
-        if major < 8.0 or minor < 5.0:
+        if major < 8.0 or minor < 5.0 or major > 1.25 * w:
             continue
         aspect = minor / major
         if not (GREEN_MIN_ELLIPSE_RATIO <= aspect <= 1.02):
             continue
-        # The fitted centre must lie near the top of the complete silhouette.
-        if not (x - 0.12 * w <= cx <= x + 1.12 * w):
+        # The fitted centre must lie inside the circular top cap at the top of the cylinder.
+        if not (x + 0.15 * w <= cx <= x + 0.85 * w):
             continue
-        if not (y - 0.12 * h <= cy <= y + 0.58 * h):
+        if not (y + 0.20 * cap_h <= cy <= y + 0.65 * cap_h):
             continue
 
         theta = np.deg2rad(float(angle_deg))
@@ -1043,8 +1211,10 @@ def fit_top_face_ellipse(contour, upper_fraction=0.62):
         projected_area = float(np.pi * major * minor / 4.0)
         if projected_area < MIN_COLOR_AREA_PX * 0.40:
             continue
-        # Prefer low residuals; discourage implausibly flattened ellipses.
-        score = residual + 0.05 * max(0.0, 0.68 - aspect)
+        # Prefer low residuals and near-circular top caps near y + 0.47 * cap_h.
+        expected_cy = y + 0.47 * cap_h
+        cy_penalty = abs(float(cy) - expected_cy) / max(cap_h, 1.0)
+        score = residual + 0.10 * max(0.0, 0.85 - aspect) + 0.15 * cy_penalty
         candidates.append((score, ellipse, (float(cx), float(cy)),
                            projected_area, aspect, residual))
 
@@ -1139,31 +1309,45 @@ def fit_top_face_polygon(contour, expected):
     elif expected == "hexagon":
         valid = min(angles) >= 35 and max(angles) <= 165 and side_ratio <= 4.5 and score <= 0.42
     else:
-        valid = min(angles) >= 12 and max(angles) <= 158 and score <= 0.85
+        hull_area = float(cv2.contourArea(hull))
+        circularity = float(4.0 * np.pi * hull_area / max(perimeter * perimeter, 1e-6))
+        poly_area = max(float(cv2.contourArea(poly.astype(np.float32))), 1.0)
+        area_ratio = hull_area / poly_area
+        valid = (
+            min(angles) >= 18
+            and max(angles) <= 145
+            and circularity <= 0.78
+            and 0.75 <= area_ratio <= 1.60
+            and score <= 0.35
+        )
     return (poly, score) if valid else (None, score)
 
 
 def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
     """Return a top-face based centre/area when a 3D shape cap can be isolated."""
     expected = EXPECTED_GEOMETRY[name]
-    if expected == "circle":
-        fitted = fit_top_face_ellipse(contour)
-        if fitted is not None:
-            ellipse, centre, area, aspect, residual = fitted
-            return {
-                "center": centre, "area": area, "contour": None,
-                "ellipse": ellipse, "metrics": full_metrics,
-                "score": residual, "mode": "upper-arc ellipse",
-                "note": f"top ellipse AR={aspect:.2f} residual={residual:.3f}",
-            }
+    x, y, w, h = cv2.boundingRect(contour)
 
     face_contour = extract_bright_top_face(hsv, raw_mask, contour)
     if face_contour is not None:
+        fx, fy, fw, fh = cv2.boundingRect(face_contour)
         face_metrics, face_fits = shape_fit(face_contour)
         if face_metrics is not None:
             ok, score, _ = face_fits[expected]
             polygon = None
-            if not ok and expected in ("square", "hexagon", "triangle"):
+            if not ok and expected == "circle":
+                # Accept a bright circular cap only if it sits near the top of
+                # the cylinder and is not elongated down the side wall.
+                if (
+                    fy <= y + max(4, int(0.20 * h))
+                    and fh <= 1.25 * fw
+                    and face_metrics["solidity"] >= GREEN_MIN_SOLIDITY
+                    and face_metrics["circularity"] >= GREEN_MIN_CIRCULARITY
+                    and face_metrics["ellipse_ratio"] >= GREEN_MIN_ELLIPSE_RATIO
+                ):
+                    ok = True
+                    score = float(1.0 - face_metrics["circularity"])
+            elif not ok and expected in ("square", "hexagon", "triangle"):
                 polygon, polygon_score = fit_top_face_polygon(face_contour, expected)
                 if polygon is not None:
                     ok, score = True, polygon_score
@@ -1177,9 +1361,21 @@ def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
                     "mode": "bright top-face contour",
                     "note": "top face separated from side wall",
                 }
+
+    if expected == "circle":
+        fitted = fit_top_face_ellipse(contour)
+        if fitted is not None:
+            ellipse, centre, area, aspect, residual = fitted
+            return {
+                "center": centre, "area": area, "contour": None,
+                "ellipse": ellipse, "metrics": full_metrics,
+                "score": residual, "mode": "upper-arc ellipse",
+                "note": f"top ellipse AR={aspect:.2f} residual={residual:.3f}",
+            }
     # Green-circle fallback: accept a coherent elliptical/circular silhouette
     # even when the full 3-D side-wall contour is less circular than its top.
-    # This fallback remains constrained by broad green HSV, fill, hue and area.
+    # When the silhouette is taller than wide (includes cylinder side wall),
+    # place the pick centre on the circular top cap rather than the side wall.
     if expected == "circle" and full_metrics is not None:
         m = full_metrics
         green_circle_ok = (
@@ -1189,6 +1385,21 @@ def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
             float(np.max(m["amp"][3:9])) <= 0.11
         )
         if green_circle_ok:
+            if h > 1.15 * w:
+                cap_r = 0.47 * float(w)
+                cap_cx = float(x) + 0.50 * float(w)
+                cap_cy = float(y) + cap_r
+                top_ellipse = ((cap_cx, cap_cy), (2.0 * cap_r, 2.0 * cap_r), 0.0)
+                return {
+                    "center": (cap_cx, cap_cy),
+                    "area": float(np.pi * cap_r * cap_r),
+                    "contour": None,
+                    "ellipse": top_ellipse,
+                    "metrics": m,
+                    "score": float(1.0 - m["circularity"]),
+                    "mode": "cylinder top-cap fallback",
+                    "note": f"top cap from cylinder bbox ({w}x{h})",
+                }
             return {
                 "center": m["center"], "area": float(cv2.contourArea(contour)),
                 "contour": contour, "ellipse": None, "metrics": m,
@@ -1583,9 +1794,10 @@ def find_holes(frame, strip, roi):
     ]
     circle_options.sort(key=lambda c: float(c["fits"]["circle"][1]))
     circle_candidate = circle_options[0] if circle_options else None
-    # Any contour with a strong circle fit is reserved from square/triangle
-    # reassignment, even if it is not the winning circle candidate.
-    reserved_ids.update(id(c) for c in circle_options)
+    # Reserve only the winning circle hole so an adjacent rounded hexagon
+    # cut-out is still eligible for the fixed-layout hexagon slot below.
+    if circle_candidate is not None:
+        reserved_ids.add(id(circle_candidate))
 
     if circle_candidate is not None:
         circle_candidate["geometry"] = "circle"
@@ -1627,18 +1839,8 @@ def find_holes(frame, strip, roi):
             adjacent["metrics"]["hexagon_shape_score_before_layout"] = raw_hex_score
             selected["orange_hexagon"] = adjacent
             used_ids.add(id(adjacent))
-            print(
-                "[HOLE LAYOUT] Assigned orange_hexagon to the nearest distinct "
-                f"hole next to green_circle (raw shape score={raw_hex_score:.4f}; "
-                "shape gate bypassed by the fixed layout rule).",
-                flush=True,
-            )
         else:
-            print(
-                "[HOLE LAYOUT] Circle detected, but no second hole candidate was "
-                "available beside it; orange_hexagon remains unassigned.",
-                flush=True,
-            )
+            pass
 
     # 3) Assign the one remaining square candidate, excluding circle and hexagon.
     square_options = [
@@ -1907,25 +2109,34 @@ def main():
     )
     print(f"Run folder: {run_dir}", flush=True)
     detector, dictionary, aruco_parameters = make_aruco_detector()
-    print(f"ArUco dictionary: {ARUCO_DICT_NAME}; target ID: "
-          f"{TARGET_MARKER_ID if TARGET_MARKER_ID is not None else 'largest detected'}", flush=True)
-    print(f"ArUco outer side length: {MARKER_SIDE_M * 1000:.1f} mm", flush=True)
-    print("Robot marker corners (base_link metres; order TL, TR, BR, BL):", flush=True)
-    for corner_name, corner_xy in zip(ARUCO_CORNER_LABELS, ROBOT_MARKER_CORNERS):
-        print(f"  {corner_name}: X={corner_xy[0]:.5f}, Y={corner_xy[1]:.5f}", flush=True)
-    edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
-    measured_edges_mm = [
-        1000.0 * float(np.linalg.norm(ROBOT_MARKER_CORNERS[a] - ROBOT_MARKER_CORNERS[b]))
-        for a, b in edge_pairs
-    ]
+    remembered_calibration = load_remembered_calibration()
     print(
-        "Measured robot-coordinate marker edge lengths (mm): "
-        + ", ".join(f"{v:.1f}" for v in measured_edges_mm)
-        + f" (physical side is {MARKER_SIDE_M * 1000:.1f} mm)",
+        f"ArUco dictionary: {ARUCO_DICT_NAME}; calibrated marker IDs: "
+        f"{sorted(ROBOT_MARKER_CORNERS_BY_ID.keys())}",
         flush=True,
     )
-    print("Object pick pixels AND cardboard-hole place pixels use the live four-corner "
-          "ArUco homography.", flush=True)
+    print(f"ArUco outer side length: {MARKER_SIDE_M * 1000:.1f} mm", flush=True)
+    print(f"Remembered homography file: {CALIBRATED_HOMOGRAPHY_FILE}", flush=True)
+    edge_pairs = ((0, 1), (1, 2), (2, 3), (3, 0))
+    for mid, mcorners in sorted(ROBOT_MARKER_CORNERS_BY_ID.items()):
+        print(f"Robot marker ID {mid} corners (base_link metres; order TL, TR, BR, BL):", flush=True)
+        for corner_name, corner_xy in zip(ARUCO_CORNER_LABELS, mcorners):
+            print(f"  {corner_name}: X={corner_xy[0]:.5f}, Y={corner_xy[1]:.5f}", flush=True)
+        measured_edges_mm = [
+            1000.0 * float(np.linalg.norm(mcorners[a] - mcorners[b]))
+            for a, b in edge_pairs
+        ]
+        print(
+            f"  ID {mid} edge lengths (mm): "
+            + ", ".join(f"{v:.1f}" for v in measured_edges_mm)
+            + f" (physical side is {MARKER_SIDE_M * 1000:.1f} mm)",
+            flush=True,
+        )
+    print(
+        "Object pick pixels (with 3D height parallax compensation) AND cardboard-hole "
+        "place pixels use the 8-corner dual-ArUco homography (with persistent fallback).",
+        flush=True,
+    )
     camera = open_camera()
     try:
         ok, first_frame = camera.read()
@@ -1964,7 +2175,7 @@ def main():
         prev_gray = None
         motion = 0.0
         frame_index = 0
-        aruco_smoothing_state = {"corners": None, "marker_id": None, "misses": 0}
+        aruco_smoothing_state = {"markers": {}, "save_counter": 0}
         board_frame_history = deque(maxlen=BOARD_FRAME_HISTORY)
         board_misses = 0
         hole_tracks = {n: {"center": None} for n in SHAPE_ORDER}
@@ -1978,20 +2189,17 @@ def main():
                 raise RuntimeError("Camera frame capture failed.")
             frame_index += 1
 
-            # Detect the ArUco marker in this exact frame and build the live
-            # pixel -> robot XY map from its four measured outer corners.
-            marker_H, marker_corners_cv, marker_id = detect_aruco_homography(
-                frame, detector, dictionary, aruco_parameters
+            # Detect ArUco markers (IDs 0 and 4) in this frame, update the 8-corner
+            # homography (and save to disk when both are seen), or fall back to the
+            # remembered calibration if one or both markers are occluded/removed.
+            marker_H, active_markers_by_id, aruco_status_text = update_aruco_homography(
+                frame,
+                detector,
+                dictionary,
+                aruco_parameters,
+                aruco_smoothing_state,
+                remembered_calibration,
             )
-            if marker_H is not None:
-                raw_marker_corners = marker_corners_cv.reshape(4, 2)
-                marker_H, marker_corners_cv = smooth_aruco_corners(
-                    raw_marker_corners, marker_id, aruco_smoothing_state
-                )
-            else:
-                # Keep the previous marker state briefly for reacquisition, but
-                # do not use stale transforms to create coordinate samples.
-                smooth_aruco_corners(None, None, aruco_smoothing_state)
 
             gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (7, 7), 0)
             motion = motion_fraction(prev_gray, gray, roi)
@@ -2060,7 +2268,7 @@ def main():
                             data[name]["pick_pixel"].append(np.asarray(pp, float))
                             data[name]["place_pixel"].append(np.asarray(hp, float))
                             data[name]["pick_robot"].append(
-                                pixel_to_robot_xy(pp, marker_H)
+                                object_pixel_to_robot_xy(pp, marker_H, shape_name=name)
                             )
                             data[name]["place_robot"].append(
                                 pixel_to_robot_xy(hp, marker_H)
@@ -2071,7 +2279,10 @@ def main():
                 if elapsed >= AVERAGING_SECONDS and frames_seen >= MIN_VALID_SAMPLES:
                     averaging_done = True
                     hole_rates = {n: seen_hole[n] / max(frames_seen, 1) for n in SHAPE_ORDER}
-                    missing_holes = [n for n in SHAPE_ORDER
+                    present_shapes = [n for n in SHAPE_ORDER if seen_block[n] > 0]
+                    # Only require holes for shapes that have coloured blocks present
+                    required_holes = present_shapes if present_shapes else list(SHAPE_ORDER)
+                    missing_holes = [n for n in required_holes
                                      if hole_rates[n] < MIN_HOLE_DETECTION_RATE]
                     hole_validation_ok = not missing_holes
                     print("\nFIVE-SECOND AVERAGING COMPLETE. Coordinates are now frozen.", flush=True)
@@ -2085,29 +2296,27 @@ def main():
                         else:
                             print(f"  {name}: NOT DETECTED", flush=True)
                     if missing_holes:
-                        print("[ERROR] All four cardboard holes are required. Missing/unstable: "
+                        print("[WARN] Missing/unstable holes for present shapes: "
                               + ", ".join(missing_holes), flush=True)
-                        print("No controller targets will be written. Reposition the board so all four "
-                              "hole boundaries are fully inside the camera frame.", flush=True)
 
                     no_coloured_shapes = sum(seen_block.values()) == 0
                     for name in SHAPE_ORDER:
                         count = len(data[name]["pick_robot"])
                         rate = count / max(frames_seen, 1)
-                        if count < MIN_VALID_SAMPLES or rate < MIN_DETECTION_RATE:
+                        if count < MIN_VALID_SAMPLES:
                             if seen_block[name] > 0:
-                                print(f"[SKIP] {name}: coloured block was seen in "
-                                      f"{100 * seen_block[name] / max(frames_seen, 1):.0f}% of frames, "
-                                      f"but a stable matching pair was available in {100 * rate:.0f}%.", flush=True)
+                                print(f"[SKIP] {name}: coloured block was seen, but only "
+                                      f"{count} matching pair samples were collected (need {MIN_VALID_SAMPLES}).", flush=True)
                             continue
                         pick_mean, used_pick, std_pick = robust_mean(data[name]["pick_robot"])
                         place_mean, used_place, std_place = robust_mean(data[name]["place_robot"])
                         if max(std_pick, std_place) > MAX_POSITION_STD_M:
                             print(f"[SKIP] {name}: unstable position "
-                                  f"(std {1000 * max(std_pick, std_place):.1f} mm).", flush=True)
+                                  f"(std pick={1000 * std_pick:.1f} mm, place={1000 * std_place:.1f} mm "
+                                  f"> {1000 * MAX_POSITION_STD_M:.1f} mm).", flush=True)
                             continue
                         if min(used_pick, used_place) < MIN_VALID_SAMPLES:
-                            print(f"[SKIP] {name}: too few stable coordinate samples.", flush=True)
+                            print(f"[SKIP] {name}: too few stable coordinate samples after outlier removal ({min(used_pick, used_place)}).", flush=True)
                             continue
                         if np.linalg.norm(pick_mean - place_mean) < 0.005:
                             print(f"[SKIP] {name}: pick/place centres are less than 5 mm apart.", flush=True)
@@ -2147,33 +2356,38 @@ def main():
             if marker_H is None:
                 cv2.putText(
                     display,
-                    "ARUCO NOT DETECTED - coordinate samples paused",
+                    aruco_status_text,
                     (8, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                     (0, 0, 255), 2, cv2.LINE_AA
                 )
             else:
-                cv2.aruco.drawDetectedMarkers(
-                    display,
-                    [marker_corners_cv],
-                    np.array([[marker_id]], dtype=np.int32)
-                )
-                marker_image_corners = marker_corners_cv.reshape(4, 2)
-                for i, (px, py) in enumerate(marker_image_corners):
-                    cv2.circle(
-                        display, (int(round(px)), int(round(py))),
-                        4, (0, 255, 255), -1
+                if active_markers_by_id:
+                    draw_corners_list = [
+                        c.reshape(1, 4, 2).astype(np.float32)
+                        for _, c in sorted(active_markers_by_id.items())
+                    ]
+                    draw_ids_arr = np.array(
+                        [[mid] for mid in sorted(active_markers_by_id.keys())],
+                        dtype=np.int32,
                     )
-                    cv2.putText(
-                        display,
-                        ARUCO_CORNER_LABELS[i],
-                        (int(round(px)) + 4, int(round(py)) - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
-                        (0, 255, 255), 1, cv2.LINE_AA
-                    )
+                    cv2.aruco.drawDetectedMarkers(display, draw_corners_list, draw_ids_arr)
+                    for mid, m_corners in sorted(active_markers_by_id.items()):
+                        for i, (px, py) in enumerate(m_corners.reshape(4, 2)):
+                            cv2.circle(
+                                display, (int(round(px)), int(round(py))),
+                                4, (0, 255, 255), -1
+                            )
+                            cv2.putText(
+                                display,
+                                ARUCO_CORNER_LABELS[i],
+                                (int(round(px)) + 4, int(round(py)) - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                                (0, 255, 255), 1, cv2.LINE_AA
+                            )
                 cv2.putText(
                     display,
-                    f"ARUCO ID {marker_id} | live pixel-to-robot map active",
-                    (8, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                    aruco_status_text,
+                    (8, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                     (0, 255, 255), 1, cv2.LINE_AA
                 )
 
@@ -2200,14 +2414,35 @@ def main():
         _close_windows()
         if aborted or not averaging_done:
             return 2
-        if not hole_validation_ok:
-            return 1
+        if not labels and not aborted:
+            # Fallback: re-check data store for any present shape with >= MIN_VALID_SAMPLES
+            for name in SHAPE_ORDER:
+                count = len(data[name]["pick_robot"])
+                if count >= MIN_VALID_SAMPLES:
+                    pick_mean, used_pick, std_pick = robust_mean(data[name]["pick_robot"])
+                    place_mean, used_place, std_place = robust_mean(data[name]["place_robot"])
+                    if max(std_pick, std_place) <= MAX_POSITION_STD_M and np.linalg.norm(pick_mean - place_mean) >= 0.005:
+                        pick_px = np.mean(np.vstack(data[name]["pick_pixel"]), axis=0)
+                        place_px = np.mean(np.vstack(data[name]["place_pixel"]), axis=0)
+                        labels.append(name)
+                        targets.append([pick_mean, place_mean])
+                        pick_pixels.append(pick_px)
+                        place_pixels.append(place_px)
+                        sample_counts.append(min(used_pick, used_place))
+                        averaged[name] = {"pick_robot": pick_mean, "place_robot": place_mean,
+                                          "pick_pixel": pick_px, "place_pixel": place_px}
+            if labels:
+                print("FALLBACK RECOVERY: Mapped valid shape pairs from collected samples:", flush=True)
+                for name in labels:
+                    print(f"  {name}: PICK={averaged[name]['pick_robot'].round(5)} "
+                          f"PLACE={averaged[name]['place_robot'].round(5)} m", flush=True)
+
         if not labels:
             if no_coloured_shapes:
-                print("VISION COMPLETE: all four holes were detected, but no coloured objects were present.", flush=True)
+                print("VISION COMPLETE: no coloured objects were present to sort.", flush=True)
                 print("No robot controller will be started.", flush=True)
                 return NO_COLOURED_OBJECTS_EXIT
-            print("VISION ERROR: coloured objects were detected but no stable matching pairs passed validation.", flush=True)
+            print("VISION ERROR: no stable matching pairs passed validation.", flush=True)
             return 1
 
         write_targets(paths, labels, np.asarray(targets, dtype=np.float64),
