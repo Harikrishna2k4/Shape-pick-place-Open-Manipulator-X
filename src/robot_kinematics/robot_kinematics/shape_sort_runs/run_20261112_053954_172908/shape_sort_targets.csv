@@ -1,0 +1,2 @@
+shape,paired_samples,pick_pixel_x,pick_pixel_y,pick_robot_x_m,pick_robot_y_m,place_pixel_x,place_pixel_y,place_robot_x_m,place_robot_y_m
+blue_square,131,557.8125495278149,236.5749438497384,0.03401155394494982,0.048671576593603404,302.4126802048088,148.9988421031299,0.22771172907971243,-0.0583591646877409

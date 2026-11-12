@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-second live shape sorting using a live four-corner ArUco homography.
+"""Stabilised five-second shape sorting using live four-corner ArUco homography.
 
 No user selection is needed anywhere:
   1) The cardboard task board is found automatically.
@@ -20,6 +20,8 @@ import os
 import csv
 import sys
 import time
+from collections import deque
+from itertools import permutations
 
 os.environ.setdefault("QT_X11_NO_MITSHM", "1")   # avoids MIT-SHM BadAccess with Qt-based OpenCV
 
@@ -76,6 +78,8 @@ ROBOT_MARKER_CORNERS = np.array([
 
 ARUCO_CORNER_LABELS = ("TL", "TR", "BR", "BL")
 ARUCO_MIN_AREA_PX = 80.0
+ARUCO_CORNER_SMOOTHING_ALPHA = 0.35
+ARUCO_MAX_CORNER_JUMP_PX = 25.0
 
 
 # ------------------------- OBJECT CLASSES -------------------------
@@ -192,10 +196,18 @@ MIN_CARDBOARD_FRACTION = 0.02          # strip must cover >= 2% of the frame
 # The cardboard strip is in the central-left task area in the current camera
 # setup. Restricting the search to this region prevents table/floor colours
 # outside the task area from becoming a false cardboard component.
-CARDBOARD_SEARCH_X = (0.07, 0.50)       # fractions of frame width
+CARDBOARD_SEARCH_X = (0.30, 0.72)       # current board spans the centre-right of this camera view
 CARDBOARD_SEARCH_Y = (0.00, 1.00)       # fractions of frame height
 CARDBOARD_RECT_ASPECT = (0.12, 0.62)    # short side / long side of the strip
-CARDBOARD_CENTER_X_RANGE = (0.20, 0.34) # expected strip centre, as frame-width fractions
+CARDBOARD_CENTER_X_RANGE = (0.42, 0.60) # expected strip centre, as frame-width fractions
+
+# Temporal stabilisation for the board and detected centres.
+BOARD_FRAME_HISTORY = 7          # frames averaged before each board update
+BOARD_REFRESH_EVERY = 5          # update board geometry every 5 camera frames
+BOARD_SMOOTHING_ALPHA = 0.30     # weight of the new board estimate (lower = steadier)
+BOARD_MAX_MISSES = 12            # retain prior board through brief segmentation dropouts
+HOLE_CENTER_ALPHA = 0.25         # EMA update for detected hole centres
+HOLE_TRACK_MAX_JUMP_PX = 22.0
 MIN_HOLE_AREA_PX = 110.0
 MAX_HOLE_AREA_PX = 16000.0
 HOLE_MORPH_KERNEL = 3
@@ -319,6 +331,38 @@ def cardboard_mask(hsv, lo, hi):
     return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
 
+
+def smooth_aruco_corners(detected_corners, marker_id, state):
+    """EMA-smooth the four image corners while preserving the current marker ID."""
+    if detected_corners is None or marker_id is None:
+        state["misses"] = state.get("misses", 0) + 1
+        if state["misses"] > 3:
+            state["corners"] = None
+            state["marker_id"] = None
+        return None, None
+
+    current = np.asarray(detected_corners, dtype=np.float64).reshape(4, 2)
+    previous = state.get("corners")
+    previous_id = state.get("marker_id")
+    if previous is None or previous_id != marker_id:
+        stable = current
+    elif float(np.max(np.linalg.norm(current - previous, axis=1))) > ARUCO_MAX_CORNER_JUMP_PX:
+        # A large jump is likely a genuine board/camera movement or a marker switch.
+        stable = current
+    else:
+        alpha = float(ARUCO_CORNER_SMOOTHING_ALPHA)
+        stable = (1.0 - alpha) * previous + alpha * current
+
+    state["corners"] = stable.copy()
+    state["marker_id"] = int(marker_id)
+    state["misses"] = 0
+    stable = stable.astype(np.float32)
+    H = cv2.getPerspectiveTransform(stable, ROBOT_MARKER_CORNERS)
+    if not np.all(np.isfinite(H)) or abs(float(np.linalg.det(H))) < 1e-12:
+        return None, None
+    return H, stable.reshape(1, 4, 2)
+
+
 def detect_cardboard(frames, announce=True):
     """Detect only the task cardboard strip, independently of coloured blocks.
 
@@ -403,8 +447,8 @@ def detect_cardboard(frames, announce=True):
                 continue
 
             vertex_score = 1.0 if vertices <= 6 else max(0.55, 1.0 - 0.06 * (vertices - 6))
-            aspect_score = 1.0 - abs(aspect - 0.30)
-            centre_score = 1.0 - abs(centre_x_fraction - 0.27) / 0.10
+            aspect_score = 1.0 - abs(aspect - 0.38)
+            centre_score = 1.0 - abs(centre_x_fraction - 0.51) / 0.12
             centre_score = max(0.05, centre_score)
             score = area * solidity * rect_fill * vertex_score * aspect_score * centre_score
             full_mask = np.zeros((h, w), np.uint8)
@@ -518,6 +562,87 @@ def detect_cardboard(frames, announce=True):
               f"rectangularity={rect_fill:.2f}, HSV median={med.astype(int).tolist()}",
               flush=True)
     return result
+
+
+
+def _rebuild_strip_masks(strip, polygon):
+    """Rebuild board masks/bounds from a smoothed four-corner polygon."""
+    h, w = strip["mask"].shape[:2]
+    polygon = np.asarray(polygon, dtype=np.float32).reshape(4, 2)
+    poly_i = np.round(polygon).astype(np.int32).reshape(-1, 1, 2)
+    board_mask = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(board_mask, poly_i, 255)
+    hole_search_mask = cv2.erode(
+        board_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)),
+        iterations=1,
+    )
+    exclusion_mask = cv2.dilate(board_mask, np.ones((9, 9), np.uint8), 1)
+    bx, by, bw, bh = cv2.boundingRect(poly_i)
+    pad = 3
+    strip["bbox"] = (
+        max(bx - pad, 0), max(by - pad, 0),
+        min(bx + bw + pad, w), min(by + bh + pad, h),
+    )
+    strip["board_polygon"] = poly_i
+    strip["board_mask"] = board_mask
+    strip["hole_search_mask"] = hole_search_mask
+    strip["mask"] = exclusion_mask
+    strip["clipped_edges"] = []
+    if bx <= 1: strip["clipped_edges"].append("left")
+    if by <= 1: strip["clipped_edges"].append("top")
+    if bx + bw >= w - 1: strip["clipped_edges"].append("right")
+    if by + bh >= h - 1: strip["clipped_edges"].append("bottom")
+    return strip
+
+
+def smooth_cardboard_detection(previous, candidate):
+    """EMA-smooth board corners and colour thresholds, matching corner order."""
+    if candidate is None:
+        return previous
+    if previous is None:
+        return candidate
+
+    prev_poly = np.asarray(previous["board_polygon"], dtype=np.float64).reshape(4, 2)
+    cand_poly = np.asarray(candidate["board_polygon"], dtype=np.float64).reshape(4, 2)
+    # cv2.boxPoints may rotate its start corner; choose the permutation that
+    # minimises correspondence error before smoothing.
+    best = min(
+        permutations(range(4)),
+        key=lambda order: float(np.sum((cand_poly[list(order)] - prev_poly) ** 2)),
+    )
+    cand_poly = cand_poly[list(best)]
+    alpha = float(BOARD_SMOOTHING_ALPHA)
+    smoothed_poly = (1.0 - alpha) * prev_poly + alpha * cand_poly
+
+    result = dict(candidate)
+    for key in ("lo", "hi"):
+        if key in previous and key in candidate:
+            result[key] = np.clip(
+                (1.0 - alpha) * np.asarray(previous[key], dtype=np.float32)
+                + alpha * np.asarray(candidate[key], dtype=np.float32),
+                0, 255,
+            ).astype(np.uint8)
+    result = _rebuild_strip_masks(result, smoothed_poly)
+    return result
+
+
+def smooth_hole_centres(holes, tracks):
+    """Stabilise hole-centre coordinates without changing their contours/classes."""
+    stable = {}
+    for name, hole in holes.items():
+        centre = np.asarray(hole["center_px"], dtype=np.float64)
+        state = tracks.setdefault(name, {"center": None})
+        old = state["center"]
+        if old is None or float(np.linalg.norm(centre - old)) > HOLE_TRACK_MAX_JUMP_PX:
+            state["center"] = centre.copy()
+        else:
+            a = float(HOLE_CENTER_ALPHA)
+            state["center"] = (1.0 - a) * old + a * centre
+        item = dict(hole)
+        item["center_px"] = state["center"].copy()
+        stable[name] = item
+    return stable
 
 
 def mask_to_roi(mask, roi):
@@ -681,6 +806,41 @@ def fit_hole_triangle(metrics):
     if score > HOLE_TRIANGLE_MAX_MATCH_SCORE:
         return None, score
     return triangle, score
+
+
+def fit_hole_square(metrics, contour_square_score):
+    """Recognise a perspective-distorted square cut-out from its stable hull.
+
+    This fallback is restricted to cardboard holes. It accepts a slightly
+    incomplete/soft-edged square only when the convex hull has a stable
+    four-corner fit, plausible corner angles, near-square side proportions,
+    and a good square-template score. Coloured-object classification is
+    unchanged.
+    """
+    solidity = float(metrics["solidity"])
+    rect_fill = float(metrics["rect_fill"])
+    aspect = float(metrics["aspect"])
+    if solidity < 0.72:
+        return None, float("inf")
+    if rect_fill < 0.60 or rect_fill > 0.90:
+        return None, float("inf")
+    if aspect < 0.68:
+        return None, float("inf")
+    score = float(contour_square_score)
+    if score > 0.10:
+        return None, score
+
+    hull = metrics["hull"]
+    perimeter = float(metrics["perimeter"])
+    quad = fit_polygon(hull, perimeter, 4)
+    if quad is None:
+        return None, score
+    angles = polygon_internal_angles(quad)
+    if len(angles) != 4 or min(angles) < 60.0 or max(angles) > 120.0:
+        return None, score
+    if polygon_side_ratio(quad) > 2.0:
+        return None, score
+    return quad, score
 
 
 def fit_hole_hexagon(metrics, contour_hex_score):
@@ -1084,10 +1244,15 @@ def confirm_stationary_objects(objects, object_debug, tracks):
             state["hits"] = 1
 
         state["misses"] = 0
-        state["last"] = candidate
+        # Publish the EMA-smoothed centre. Previously the tracker updated its
+        # internal centre but still returned the raw per-frame centre, so the
+        # overlay and coordinate samples continued to jump.
+        smoothed_candidate = dict(candidate)
+        smoothed_candidate["center_px"] = state["center"].copy()
+        state["last"] = smoothed_candidate
 
         if state["hits"] >= OBJECT_CONFIRM_FRAMES:
-            confirmed[name] = candidate
+            confirmed[name] = smoothed_candidate
         else:
             for entry in object_debug.get(name, []):
                 if entry["contour"] is candidate["contour"]:
@@ -1345,6 +1510,15 @@ def find_holes(frame, strip, roi):
             metrics["polygon_triangle"] = hole_triangle
             metrics["hole_triangle_hull_fit"] = True
 
+        # Cardboard-only fallback for the perspective-distorted square opening.
+        # The screenshot's square cut-out has a stable four-corner hull but its
+        # raw filled contour solidity is reduced by reflections/shadows.
+        hole_square, hole_square_score = fit_hole_square(metrics, fits["square"][1])
+        if hole_square is not None and not fits["square"][0]:
+            fits["square"] = (True, hole_square_score, "")
+            metrics["polygon_square"] = hole_square
+            metrics["hole_square_hull_fit"] = True
+
         # Cardboard-only fallback for the rounded/soft-edged hexagonal opening.
         hole_hexagon, hole_hexagon_score = fit_hole_hexagon(metrics, fits["hexagon"][1])
         if np.isfinite(hole_hexagon_score):
@@ -1566,119 +1740,102 @@ def draw_cross(image, point, colour, label, radius=10):
     cv2.putText(image, label, (x + 7, y - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 2, cv2.LINE_AA)
 
 
+def _put_readable_text(image, text, origin, scale=0.38, colour=(255, 255, 255), thickness=1):
+    x, y = origin
+    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, colour, thickness, cv2.LINE_AA)
+
+
 def draw_overlay(frame, roi, strip, objects, object_debug, holes, hole_candidates,
                  sample_counts, elapsed, averaged=None, averaging_done=False, motion=0.0):
+    """Draw a low-clutter preview using only accepted, temporally smoothed centres."""
     display = frame.copy()
-    fh, fw = frame.shape[:2]
-    cv2.putText(display, "COLOUR + SHAPE DETECTION: FULL CAMERA ROI",
-                (8, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
-                (255, 255, 255), 1, cv2.LINE_AA)
-    search_x1 = int(round(CARDBOARD_SEARCH_X[0] * fw))
-    search_x2 = int(round(CARDBOARD_SEARCH_X[1] * fw))
-    search_y1 = int(round(CARDBOARD_SEARCH_Y[0] * fh))
-    search_y2 = int(round(CARDBOARD_SEARCH_Y[1] * fh))
-    cv2.rectangle(display, (search_x1, search_y1), (search_x2, search_y2),
-                  (255, 180, 0), 1, cv2.LINE_AA)
-    cv2.putText(display, "CARDBOARD SEARCH ZONE", (search_x1 + 3, max(search_y1 + 13, 13)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 180, 0), 1, cv2.LINE_AA)
+
+    # Single board outline only. Avoid drawing both polygon and axis-aligned bbox.
     if strip is not None:
-        sx1, sy1, sx2, sy2 = strip["bbox"]
         cv2.polylines(display, [strip["board_polygon"]], True,
-                      (200, 120, 255), 2, cv2.LINE_AA)
-        cv2.rectangle(display, (sx1, sy1), (sx2, sy2), (200, 120, 255), 1)
-        card_text = "CARDBOARD FOUND - independent detection"
-        if strip.get("clipped_edges"):
-            card_text += " | EDGE CLIPPED: " + ",".join(strip["clipped_edges"])
-        cv2.putText(display, card_text, (max(sx1 + 3, 8), max(sy1 + 14, 14)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 120, 255), 1, cv2.LINE_AA)
+                      (0, 220, 255), 2, cv2.LINE_AA)
+        bx, by, _, _ = strip["bbox"]
+        _put_readable_text(display, "BOARD", (max(6, bx), max(18, by - 5)),
+                           0.34, (0, 220, 255), 1)
     else:
-        cv2.putText(display, "CARDBOARD NOT DETECTED - check view/lighting",
-                    (8, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 255), 2, cv2.LINE_AA)
+        _put_readable_text(display, "BOARD NOT DETECTED", (8, 165),
+                           0.42, (0, 0, 255), 2)
 
-    for name in SHAPE_ORDER:
-        colour = DISPLAY_COLOURS[name]
-        for cand in object_debug.get(name, []):
-            accepted = name in objects and cand["contour"] is objects[name]["contour"]
-            metrics = cand["metrics"]
-            if accepted:
-                if cand.get("face_ellipse") is not None:
-                    cv2.ellipse(display, cand["face_ellipse"], colour, 3, cv2.LINE_AA)
-                elif cand.get("face_contour") is not None:
-                    cv2.drawContours(display, [cand["face_contour"]], -1, colour, 3, cv2.LINE_AA)
-                else:
-                    key = "polygon_" + EXPECTED_GEOMETRY[name]
-                    if metrics.get(key) is not None:
-                        poly = np.asarray(metrics[key], np.int32).reshape(-1, 1, 2)
-                        cv2.polylines(display, [poly], True, colour, 3, cv2.LINE_AA)
-                    else:
-                        cv2.drawContours(display, [cand["contour"]], -1, colour, 3)
-                if cand.get("face_mode"):
-                    cx, cy = metrics["center"]
-                    cv2.putText(display, cand.get("face_mode", "top face"),
-                                (int(cx) - 35, int(cy) + 18), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.30, colour, 1, cv2.LINE_AA)
-            else:
-                cv2.drawContours(display, [cand["contour"]], -1, (0, 0, 255), 1)
-                if metrics is not None:
-                    cx, cy = metrics["center"]
-                    cv2.putText(display, f"X {name.split('_')[1]}: {cand['reason']}",
-                                (int(cx) - 20, int(cy)), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.34, (0, 0, 255), 1, cv2.LINE_AA)
-
-    # Thin outlines show every candidate; thicker magenta outlines and crosses
-    # identify the selected centre of each independently detected hole.
-    for cand in hole_candidates:
-        if cand["ok"]:
-            cv2.drawContours(display, [cand["contour"]], -1, (200, 120, 255), 1)
-            cx, cy = cand["center_px"]
-            cv2.putText(display, f"hole candidate: {cand['geometry']}",
-                        (int(cx) - 30, int(cy) + 12), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.32, (200, 120, 255), 1, cv2.LINE_AA)
-        else:
-            cv2.drawContours(display, [cand["contour"]], -1, (0, 0, 255), 1)
-            cx, cy = cand["center_px"]
-            cv2.putText(display, f"X hole: {cand['reason']}",
-                        (int(cx) - 30, int(cy) + 12), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.30, (0, 0, 255), 1, cv2.LINE_AA)
-
+    # Draw only the selected holes; do not draw the same hole once as a
+    # candidate and again as a selected result.
     for name, hole in holes.items():
-        cv2.drawContours(display, [hole["contour"]], -1, (255, 0, 255), 3)
-        draw_cross(display, hole["center_px"], (255, 255, 255), f"HOLE {name}")
+        cv2.drawContours(display, [hole["contour"]], -1, (255, 0, 255), 1, cv2.LINE_AA)
+        draw_cross(display, hole["center_px"], (255, 255, 255),
+                   f"HOLE {name.split('_')[0]}", 7)
 
-    pair_names = [name for name in SHAPE_ORDER if name in objects and name in holes]
+    # Draw only accepted object detections. Rejected contour/reason labels are
+    # available through the M colour-mask view and are omitted from the main view.
     for name, obj in objects.items():
-        draw_cross(display, obj["center_px"], DISPLAY_COLOURS[name], f"PICK {name}")
+        colour = DISPLAY_COLOURS[name]
+        cand = next((c for c in object_debug.get(name, [])
+                     if c["contour"] is obj["contour"]), None)
+        if cand is not None:
+            if cand.get("face_ellipse") is not None:
+                cv2.ellipse(display, cand["face_ellipse"], colour, 2, cv2.LINE_AA)
+            elif cand.get("face_contour") is not None:
+                cv2.drawContours(display, [cand["face_contour"]], -1, colour, 2, cv2.LINE_AA)
+            else:
+                cv2.drawContours(display, [obj["contour"]], -1, colour, 2, cv2.LINE_AA)
+        draw_cross(display, obj["center_px"], colour,
+                   f"PICK {name.split('_')[0]}", 8)
         if name in holes:
             a = tuple(map(int, np.round(obj["center_px"])))
             b = tuple(map(int, np.round(holes[name]["center_px"])))
-            cv2.line(display, a, b, DISPLAY_COLOURS[name], 2, cv2.LINE_AA)
+            cv2.line(display, a, b, colour, 1, cv2.LINE_AA)
+
+    # Keep frozen averaged targets visible as small dots; live centres above
+    # are smoothed and may continue moving slightly with the objects.
+    if averaged:
+        for name, item in averaged.items():
+            for key, colour in (("pick_pixel", (0, 0, 255)),
+                                ("place_pixel", (255, 255, 255))):
+                point = tuple(map(int, np.round(item[key])))
+                cv2.circle(display, point, 4, colour, 1, cv2.LINE_AA)
 
     if motion > MOTION_FRACTION_MAX:
-        status, scol = ("MOTION DETECTED - HOLD STILL (timer restarts)" if not averaging_done
-                        else "MOTION IN VIEW (targets stay frozen)"), (0, 0, 255)
+        status = "MOTION DETECTED - HOLD STILL"
+        status_colour = (0, 0, 255)
     elif not averaging_done:
-        status, scol = f"AVERAGING {elapsed:.1f}/{AVERAGING_SECONDS:.1f}s", (0, 255, 255)
+        status = f"AVERAGING {elapsed:.1f}/{AVERAGING_SECONDS:.1f}s"
+        status_colour = (0, 255, 255)
     else:
-        status, scol = "AVERAGING FROZEN - LIVE PREVIEW CONTINUES", (0, 255, 255)
-    cv2.putText(display, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, scol, 2, cv2.LINE_AA)
-    cv2.putText(display, "Q/ESC: accept and continue | X: abort | M: colour masks",
-                (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
-    valid_hole_count = sum(1 for c in hole_candidates if c["ok"])
-    cv2.putText(display,
-                f"COLOURED OBJECTS: {len(objects)}/4 | CARDBOARD HOLES: {len(holes)}/4 | HOLE CANDIDATES: {valid_hole_count} | PAIRS: {len(pair_names)}",
-                (8, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (255, 255, 255), 1, cv2.LINE_AA)
+        status = "TARGETS FROZEN - LIVE PREVIEW"
+        status_colour = (0, 255, 255)
 
+    valid_hole_count = len(holes)
+    pair_names = [name for name in SHAPE_ORDER if name in objects and name in holes]
+    _put_readable_text(display, status, (8, 20), 0.48, status_colour, 2)
+    _put_readable_text(display, "Q/ESC: accept | X: abort | M: colour masks",
+                       (8, 42), 0.34, (255, 255, 255), 1)
+    _put_readable_text(
+        display,
+        f"BLOCKS {len(objects)}/4   HOLES {valid_hole_count}/4   PAIRS {len(pair_names)}",
+        (8, 64), 0.38, (255, 255, 255), 1,
+    )
+
+    short_names = {
+        "green_circle": "GREEN CIRCLE",
+        "blue_square": "BLUE SQUARE",
+        "orange_hexagon": "ORANGE HEX",
+        "yellow_triangle": "YELLOW TRI",
+    }
     for i, name in enumerate(SHAPE_ORDER):
-        line = (f"{name}: block={'YES' if name in objects else 'no'} "
-                f"hole={'YES' if name in holes else 'MISSING'} "
-                f"paired samples={sample_counts.get(name, 0)}")
-        if averaged and name in averaged:
-            p, q = averaged[name]["pick_robot"], averaged[name]["place_robot"]
-            line += f" | AVG PICK=({p[0]:.3f},{p[1]:.3f}) PLACE=({q[0]:.3f},{q[1]:.3f})m"
-            draw_cross(display, averaged[name]["pick_pixel"], (0, 0, 255), f"AVG PICK {name}", 14)
-            draw_cross(display, averaged[name]["place_pixel"], (255, 255, 255), f"AVG PLACE {name}", 14)
-        cv2.putText(display, line, (8, 80 + 18 * i), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.31, DISPLAY_COLOURS[name], 1, cv2.LINE_AA)
+        block_ok = name in objects
+        hole_ok = name in holes
+        samples = int(sample_counts.get(name, 0))
+        line = (f"{short_names[name]}  block:{'OK' if block_ok else '--'}  "
+                f"hole:{'OK' if hole_ok else '--'}  samples:{samples}")
+        _put_readable_text(display, line, (8, 88 + 19 * i), 0.32,
+                           DISPLAY_COLOURS[name], 1)
+
     return display
 
 
@@ -1784,7 +1941,7 @@ def main():
             print("[WARN] Cardboard not found at startup; the detector will retry on live frames.", flush=True)
         elif strip.get("clipped_edges"):
             print("[WARN] Cardboard boundary touches the camera image edge. Check whether all four cut-outs are fully in frame.", flush=True)
-        print("[CARDBOARD] Detection runs independently of coloured objects and object-hole pairing.", flush=True)
+        print("[CARDBOARD] Detection uses rolling-frame averaging and smoothed board geometry.", flush=True)
         print("Keep the board and any coloured blocks stationary during the 5-second average.", flush=True)
 
         data = new_sample_store()
@@ -1807,6 +1964,10 @@ def main():
         prev_gray = None
         motion = 0.0
         frame_index = 0
+        aruco_smoothing_state = {"corners": None, "marker_id": None, "misses": 0}
+        board_frame_history = deque(maxlen=BOARD_FRAME_HISTORY)
+        board_misses = 0
+        hole_tracks = {n: {"center": None} for n in SHAPE_ORDER}
         hole_validation_ok = False
         missing_holes = list(SHAPE_ORDER)
         no_coloured_shapes = False
@@ -1822,17 +1983,38 @@ def main():
             marker_H, marker_corners_cv, marker_id = detect_aruco_homography(
                 frame, detector, dictionary, aruco_parameters
             )
+            if marker_H is not None:
+                raw_marker_corners = marker_corners_cv.reshape(4, 2)
+                marker_H, marker_corners_cv = smooth_aruco_corners(
+                    raw_marker_corners, marker_id, aruco_smoothing_state
+                )
+            else:
+                # Keep the previous marker state briefly for reacquisition, but
+                # do not use stale transforms to create coordinate samples.
+                smooth_aruco_corners(None, None, aruco_smoothing_state)
 
             gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (7, 7), 0)
             motion = motion_fraction(prev_gray, gray, roi)
             prev_gray = gray
 
-            # Re-detect the cardboard every five frames. If the board moves or
-            # the startup view was poor, its boundary and hole ROI are updated.
-            if frame_index % 5 == 0 or strip is None:
-                # Never keep a stale board footprint when the current frame
-                # no longer supports a valid cardboard detection.
-                strip = detect_cardboard([frame], announce=False)
+            # Detect the board from a rolling multi-frame average, not a single
+            # frame. Retain the last valid estimate through brief threshold
+            # dropouts and EMA-smooth its four corners to prevent mask flicker.
+            board_frame_history.append(frame.copy())
+            refresh_board = (
+                len(board_frame_history) >= min(5, BOARD_FRAME_HISTORY)
+                and (frame_index % BOARD_REFRESH_EVERY == 0
+                     or (strip is None and frame_index % 2 == 0))
+            )
+            if refresh_board:
+                board_candidate = detect_cardboard(list(board_frame_history), announce=False)
+                if board_candidate is not None:
+                    strip = smooth_cardboard_detection(strip, board_candidate)
+                    board_misses = 0
+                else:
+                    board_misses += 1
+                    if board_misses >= BOARD_MAX_MISSES:
+                        strip = None
 
             objects, object_mask, object_debug, raw_masks = find_coloured_objects(
                 frame, roi, None if strip is None else strip["mask"])
@@ -1846,6 +2028,7 @@ def main():
             else:
                 objects = confirm_stationary_objects(objects, object_debug, object_tracks)
             holes, hole_mask, hole_candidates = find_holes(frame, strip, roi)
+            holes = smooth_hole_centres(holes, hole_tracks)
 
             if not averaging_done:
                 if motion > MOTION_FRACTION_MAX:
@@ -1965,7 +2148,7 @@ def main():
                 cv2.putText(
                     display,
                     "ARUCO NOT DETECTED - coordinate samples paused",
-                    (8, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+                    (8, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                     (0, 0, 255), 2, cv2.LINE_AA
                 )
             else:
@@ -1990,7 +2173,7 @@ def main():
                 cv2.putText(
                     display,
                     f"ARUCO ID {marker_id} | live pixel-to-robot map active",
-                    (8, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+                    (8, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                     (0, 255, 255), 1, cv2.LINE_AA
                 )
 

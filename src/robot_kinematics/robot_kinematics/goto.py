@@ -1,328 +1,568 @@
 #!/usr/bin/env python3
-"""Move OpenMANIPULATOR-X from its measured joint state to a fixed joint pose.
+"""Move OpenMANIPULATOR-X to the POSE SAMPLE 17 home TCP pose.
 
-Default behaviour is a dry plan only. Add --execute to send the trajectory;
-the script then requires the operator to type MOVE before commanding the arm.
+Execution:
+    python3 goto.py                 # dry-run only
+    python3 goto.py --execute       # request torque ON, then confirm with MOVE
 
-This is joint-space interpolation, not collision-aware motion planning. It does
-not guarantee a collision-free route from every possible starting pose.
+Safety behaviour:
+- Uses the joint limits in robot_kinematics.kinematics; it does not widen them.
+- The exact sampled joint vector has joint4=2.02485 rad, outside the URDF and
+  kinematics limit (1.97 rad). It is never commanded.
+- The script preserves the recorded HOME TCP XYZ, then searches for the
+  closest feasible tool pitch and an IK configuration within the existing
+  joint limits. If none is found, it stops without sending motion.
+- Torque is requested ON before reading the live start state in --execute mode.
+- Final success is checked against fresh /joint_states feedback.
+
+No collision checking is performed. Test unloaded, keep the workspace clear,
+and keep the emergency stop accessible.
 """
 
-from __future__ import annotations
-
 import argparse
-import math
 import sys
 import time
-from typing import Dict, Optional
 
 import numpy as np
 import rclpy
-from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.action import ActionClient
+
+from std_srvs.srv import SetBool
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectoryPoint
 from control_msgs.action import FollowJointTrajectory
 from builtin_interfaces.msg import Duration
-from std_srvs.srv import SetBool
+
+from robot_kinematics.kinematics import (
+    JOINT_LIMITS,
+    forward_kinematics,
+    inverse_kinematics,
+)
 
 
-# Match the joint names and action endpoint used by the existing controller.
+# ---------------------------------------------------------------------------
+# USER CONFIGURATION
+# ---------------------------------------------------------------------------
+
 JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4"]
+
+# POSE SAMPLE 17: recorded joint vector. joint4=2.02485 rad is outside the
+# current local JOINT_LIMITS, so this is retained as a reference, not blindly
+# commanded. The script will solve for a legal equivalent configuration at
+# the same TCP position and tool pitch.
+REFERENCE_SAMPLE_Q = np.array(
+    [-0.13346, -1.29315, 0.04142, 2.02485], dtype=float
+)
+
+# End-effector position reported for POSE SAMPLE 17 (metres).
+HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
+
+# Preserve the tool pitch represented by POSE SAMPLE 17 (q2 + q3 + q4).
+HOME_TOOL_PITCH = float(np.sum(REFERENCE_SAMPLE_Q[1:]))
+
 JOINT_STATE_TOPIC = "/joint_states"
 ARM_ACTION = "/arm_controller/follow_joint_trajectory"
 TORQUE_SERVICE = "/dynamixel_hardware_interface/set_dxl_torque"
 
-# Target configuration supplied by the user (radians).
-TARGET_Q = np.array([-0.08744, -0.95720, 0.34515, 0.77159], dtype=float)
-
-# Joint limits from the project's kinematics.py (radians).
-JOINT_LIMITS = np.array([
-    [-math.pi, math.pi],  # joint1
-    [-1.5, 1.5],          # joint2
-    [-1.5, 1.4],          # joint3
-    [-1.7, 1.97],         # joint4
-], dtype=float)
-
-# Conservative initial trajectory limits. These are software limits, not
-# manufacturer-certified limits. Increase only after validating the robot.
-MAX_JOINT_VELOCITY = np.array([0.35, 0.35, 0.35, 0.35], dtype=float)  # rad/s
-MAX_JOINT_ACCELERATION = np.array([0.70, 0.70, 0.70, 0.70], dtype=float)  # rad/s^2
 FREQUENCY_HZ = 50.0
-MIN_DURATION_S = 4.0
-JOINT_STATE_TIMEOUT_S = 10.0
-JOINT_STATE_MAX_AGE_S = 0.5
-GOAL_TIME_TOLERANCE_S = 5.0
-TORQUE_SERVICE_TIMEOUT_S = 5.0
-FINAL_STATE_TIMEOUT_S = 8.0
-FINAL_JOINT_TOLERANCE_RAD = 0.05
+MIN_DURATION = 5.0
+MAX_JOINT_VELOCITY = np.array([0.5, 0.5, 0.5, 0.5], dtype=float)       # rad/s
+MAX_JOINT_ACCELERATION = np.array([0.8, 0.8, 0.8, 0.8], dtype=float)  # rad/s^2
+
+JOINT_STATE_TIMEOUT = 10.0
+JOINT_STATE_MAX_AGE = 0.5
+ACTION_SERVER_TIMEOUT = 10.0
+ACTION_RESULT_TIMEOUT = 30.0
+FINAL_POSITION_TIMEOUT = 8.0
+FINAL_JOINT_TOLERANCE = 0.05  # rad
+HOME_POSITION_TOLERANCE = 0.002  # m
+HOME_PITCH_TOLERANCE = 0.002  # rad
+
+JOINT_LIMITS = np.asarray(JOINT_LIMITS, dtype=float)
+if JOINT_LIMITS.shape != (4, 2):
+    raise RuntimeError(f"Expected JOINT_LIMITS shape (4, 2), got {JOINT_LIMITS.shape}.")
 
 
-def validate_configuration(q: np.ndarray, label: str) -> np.ndarray:
+def wrap_angle(angle: float) -> float:
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
+def make_duration(seconds: float) -> Duration:
+    sec = int(seconds)
+    nanosec = int(round((seconds - sec) * 1e9))
+    if nanosec >= 1_000_000_000:
+        sec += 1
+        nanosec -= 1_000_000_000
+    return Duration(sec=sec, nanosec=nanosec)
+
+
+def validate_joint_vector(q: np.ndarray, label: str) -> np.ndarray:
     q = np.asarray(q, dtype=float)
     if q.shape != (4,) or not np.all(np.isfinite(q)):
-        raise ValueError(f"{label} must contain four finite joint values; got {q!r}.")
-    bad = np.where((q < JOINT_LIMITS[:, 0]) | (q > JOINT_LIMITS[:, 1]))[0]
-    if len(bad):
+        raise ValueError(f"{label} must contain four finite joint values.")
+    outside = np.where((q < JOINT_LIMITS[:, 0]) | (q > JOINT_LIMITS[:, 1]))[0]
+    if len(outside):
         details = ", ".join(
-            f"{JOINT_NAMES[i]}={q[i]:.5f} outside "
-            f"[{JOINT_LIMITS[i, 0]:.3f}, {JOINT_LIMITS[i, 1]:.3f}]"
-            for i in bad
+            f"{JOINT_NAMES[i]}={q[i]:.5f} not in "
+            f"[{JOINT_LIMITS[i, 0]:.5f}, {JOINT_LIMITS[i, 1]:.5f}]"
+            for i in outside
         )
-        raise ValueError(f"{label} violates the configured joint limits: {details}")
+        raise RuntimeError(f"{label} violates robot joint limits: {details}")
     return q
 
 
-def choose_joint_delta(current_q: np.ndarray, target_q: np.ndarray) -> np.ndarray:
-    """Choose a shortest valid joint1 wrap; other joints are non-continuous."""
-    delta = target_q - current_q
-    candidates = []
-    for turns in (-1, 0, 1):
-        candidate_target = target_q.copy()
-        candidate_target[0] += 2.0 * math.pi * turns
-        if JOINT_LIMITS[0, 0] <= candidate_target[0] <= JOINT_LIMITS[0, 1]:
-            candidates.append(candidate_target[0] - current_q[0])
-    if candidates:
-        delta[0] = min(candidates, key=abs)
-    return delta
+def forward_pose(q: np.ndarray):
+    result = forward_kinematics(*np.asarray(q, dtype=float))
+    xyz = np.asarray(result[0], dtype=float)
+    if xyz.shape != (3,) or not np.all(np.isfinite(xyz)):
+        raise RuntimeError("Forward kinematics returned an invalid XYZ position.")
+    return xyz
 
 
-def quintic_profile(u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return quintic position scale s(u) and derivative ds/du."""
+def _candidate_home_solution(pitch: float, seed_q: np.ndarray):
+    """Try one pitch/seed pair and return a verified legal IK solution or None."""
+    try:
+        q = inverse_kinematics(
+            x=float(HOME_XYZ[0]),
+            y=float(HOME_XYZ[1]),
+            z=float(HOME_XYZ[2]),
+            angle=float(pitch),
+            previous_solution=np.asarray(seed_q, dtype=float),
+        )
+        if q is None:
+            return None
+        q = np.asarray(q, dtype=float)
+        if q.shape != (4,) or not np.all(np.isfinite(q)):
+            return None
+        if np.any(q < JOINT_LIMITS[:, 0] - 1e-9) or np.any(
+            q > JOINT_LIMITS[:, 1] + 1e-9
+        ):
+            return None
+
+        xyz = forward_pose(q)
+        position_error = float(np.linalg.norm(xyz - HOME_XYZ))
+        actual_pitch = float(np.sum(q[1:]))
+        pitch_error = abs(wrap_angle(actual_pitch - pitch))
+        if position_error > HOME_POSITION_TOLERANCE:
+            return None
+        if pitch_error > HOME_PITCH_TOLERANCE:
+            return None
+        return q
+    except (ValueError, RuntimeError, FloatingPointError):
+        return None
+
+
+def resolve_legal_home_configuration(seed_q: np.ndarray) -> tuple[np.ndarray, float, str]:
+    """Find the closest-pitch in-limit IK solution for the POSE SAMPLE 17 TCP.
+
+    The reference joint vector is outside the confirmed URDF limit on joint4.
+    Rather than widening limits, keep HOME_XYZ fixed and relax only the pitch
+    preference. Search outward from the recorded pitch, checking both
+    directions. A coarse scan finds a feasible interval; a finer scan then
+    finds a closer feasible pitch.
+    """
+    exact_outside = np.where(
+        (REFERENCE_SAMPLE_Q < JOINT_LIMITS[:, 0])
+        | (REFERENCE_SAMPLE_Q > JOINT_LIMITS[:, 1])
+    )[0]
+
+    if len(exact_outside) == 0:
+        q = validate_joint_vector(REFERENCE_SAMPLE_Q.copy(), "POSE SAMPLE 17")
+        xyz = forward_pose(q)
+        pos_error = float(np.linalg.norm(xyz - HOME_XYZ))
+        if pos_error <= HOME_POSITION_TOLERANCE:
+            return q, HOME_TOOL_PITCH, "exact POSE SAMPLE 17 joint configuration"
+
+    print("\n[HOME IK] Reference joint vector is not directly commandable:")
+    for i in exact_outside:
+        print(
+            f"  {JOINT_NAMES[i]}={REFERENCE_SAMPLE_Q[i]:.5f} rad; URDF/IK limit "
+            f"[{JOINT_LIMITS[i, 0]:.5f}, {JOINT_LIMITS[i, 1]:.5f}] rad"
+        )
+    print("[HOME IK] Keeping HOME XYZ fixed; searching for the nearest feasible tool pitch.")
+    print("[HOME IK] Joint limits will not be widened.")
+
+    # Distinct, limit-compliant initial guesses help the IK solver select a
+    # valid branch. Clip the reference away from exact boundaries so bounded
+    # least-squares solvers do not start exactly on a limit.
+    eps = 1e-4
+    clipped_reference = np.clip(
+        REFERENCE_SAMPLE_Q,
+        JOINT_LIMITS[:, 0] + eps,
+        JOINT_LIMITS[:, 1] - eps,
+    )
+    current_seed = np.clip(
+        np.asarray(seed_q, dtype=float),
+        JOINT_LIMITS[:, 0] + eps,
+        JOINT_LIMITS[:, 1] - eps,
+    )
+    seeds = [current_seed, clipped_reference]
+
+    # Remove duplicate seeds.
+    unique_seeds = []
+    for candidate_seed in seeds:
+        if not any(np.allclose(candidate_seed, prev, atol=1e-8) for prev in unique_seeds):
+            unique_seeds.append(candidate_seed)
+
+    max_deviation = np.deg2rad(20.0)
+    coarse_step = np.deg2rad(0.5)
+    coarse_count = int(round(max_deviation / coarse_step))
+    feasible = None
+
+    # Search the recorded pitch first, then alternate +/- offsets in increasing
+    # absolute deviation so the first feasible pitch is close to the sample.
+    offsets = [0.0]
+    for k in range(1, coarse_count + 1):
+        offsets.extend((k * coarse_step, -k * coarse_step))
+
+    for offset in offsets:
+        pitch = HOME_TOOL_PITCH + offset
+        pitch_solutions = []
+        for candidate_seed in unique_seeds:
+            q = _candidate_home_solution(pitch, candidate_seed)
+            if q is not None:
+                # Prefer a solution that requires less joint displacement from
+                # the current measured pose; both candidates satisfy the same
+                # Cartesian position and selected pitch.
+                cost = float(np.linalg.norm(q - seed_q))
+                pitch_solutions.append((cost, q))
+        if pitch_solutions:
+            _, best_q = min(pitch_solutions, key=lambda item: item[0])
+            feasible = (best_q, pitch)
+            break
+
+    if feasible is None:
+        raise RuntimeError(
+            "No IK solution was found for the POSE SAMPLE 17 HOME XYZ within "
+            "the current joint limits, even after searching tool pitch within "
+            "+/-20 degrees of the recorded 44.297-degree pitch. No trajectory "
+            "was sent. Do not widen the URDF/kinematics limits to force the "
+            "out-of-range joint4 sample."
+        )
+
+    coarse_q, coarse_pitch = feasible
+    coarse_offset = coarse_pitch - HOME_TOOL_PITCH
+    if abs(coarse_offset) > 1e-12:
+        # Refine between the reference pitch and the first feasible coarse
+        # sample, at 0.05-degree resolution, on the same side of the reference.
+        fine_step = np.deg2rad(0.05)
+        fine_count = max(0, int(np.floor(abs(coarse_offset) / fine_step)) - 1)
+        direction = 1.0 if coarse_offset > 0 else -1.0
+        best_q, best_pitch = coarse_q, coarse_pitch
+        for k in range(1, fine_count + 1):
+            pitch = HOME_TOOL_PITCH + direction * k * fine_step
+            pitch_solutions = []
+            for candidate_seed in unique_seeds:
+                q = _candidate_home_solution(pitch, candidate_seed)
+                if q is not None:
+                    cost = float(np.linalg.norm(q - seed_q))
+                    pitch_solutions.append((cost, q))
+            if pitch_solutions:
+                _, best_q = min(pitch_solutions, key=lambda item: item[0])
+                best_pitch = pitch
+                break
+        feasible = (best_q, best_pitch)
+
+    q_solution, selected_pitch = feasible
+    q_solution = validate_joint_vector(q_solution, "Limit-compliant HOME IK solution")
+    xyz_solution = forward_pose(q_solution)
+    pos_error = float(np.linalg.norm(xyz_solution - HOME_XYZ))
+    actual_pitch = float(np.sum(q_solution[1:]))
+    pitch_error = abs(wrap_angle(actual_pitch - selected_pitch))
+
+    if pos_error > HOME_POSITION_TOLERANCE:
+        raise RuntimeError(
+            f"Selected HOME IK solution misses HOME_XYZ by {pos_error * 1000:.2f} mm. "
+            "No trajectory was sent."
+        )
+    if pitch_error > HOME_PITCH_TOLERANCE:
+        raise RuntimeError(
+            f"Selected HOME IK solution pitch error is {pitch_error:.5f} rad. "
+            "No trajectory was sent."
+        )
+
+    return (
+        q_solution,
+        selected_pitch,
+        "limit-compliant IK at the exact POSE SAMPLE 17 HOME XYZ "
+        "with the closest feasible pitch found",
+    )
+
+
+def quintic_trajectory(q_start: np.ndarray, q_goal: np.ndarray):
+    """Return sampled positions, velocities, accelerations, and timestamps."""
+    delta = np.asarray(q_goal, dtype=float) - np.asarray(q_start, dtype=float)
+
+    # Peak |ds/du| for quintic blend = 1.875; peak |d2s/du2| = 10/sqrt(3).
+    duration_velocity = float(
+        np.max(1.875 * np.abs(delta) / MAX_JOINT_VELOCITY)
+    )
+    duration_acceleration = float(
+        np.max(
+            np.sqrt(
+                (10.0 / np.sqrt(3.0))
+                * np.abs(delta)
+                / MAX_JOINT_ACCELERATION
+            )
+        )
+    )
+    duration = max(MIN_DURATION, duration_velocity, duration_acceleration)
+
+    sample_count = max(3, int(np.ceil(duration * FREQUENCY_HZ)) + 1)
+    times = np.linspace(0.0, duration, sample_count)
+    u = times / duration
+
     s = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
     ds_du = 30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4
-    return s, ds_du
+    d2s_du2 = 60.0 * u - 180.0 * u**2 + 120.0 * u**3
+
+    positions = q_start[None, :] + s[:, None] * delta[None, :]
+    velocities = (ds_du[:, None] / duration) * delta[None, :]
+    accelerations = (d2s_du2[:, None] / duration**2) * delta[None, :]
+
+    velocities[0] = 0.0
+    velocities[-1] = 0.0
+    accelerations[0] = 0.0
+    accelerations[-1] = 0.0
+
+    if np.any(positions < JOINT_LIMITS[:, 0] - 1e-9) or np.any(
+        positions > JOINT_LIMITS[:, 1] + 1e-9
+    ):
+        raise RuntimeError("Planned trajectory crosses a joint limit. No command sent.")
+    if np.any(np.abs(velocities) > MAX_JOINT_VELOCITY[None, :] * 1.001):
+        raise RuntimeError("Planned trajectory exceeds configured joint velocity limits.")
+    if np.any(np.abs(accelerations) > MAX_JOINT_ACCELERATION[None, :] * 1.001):
+        raise RuntimeError("Planned trajectory exceeds configured joint acceleration limits.")
+
+    return duration, times, positions, velocities, accelerations
 
 
-def plan_joint_trajectory(current_q: np.ndarray, target_q: np.ndarray):
-    delta = choose_joint_delta(current_q, target_q)
-
-    # Peak |ds/du| for a quintic profile is 1.875. The bound 5.774 is a
-    # conservative bound for the peak absolute second derivative.
-    duration_v = float(np.max(1.875 * np.abs(delta) / MAX_JOINT_VELOCITY))
-    duration_a = float(np.max(np.sqrt(5.774 * np.abs(delta) / MAX_JOINT_ACCELERATION)))
-    duration = max(MIN_DURATION_S, duration_v, duration_a)
-
-    n_intervals = max(2, int(math.ceil(duration * FREQUENCY_HZ)))
-    sample_times = np.linspace(0.0, duration, n_intervals + 1)[1:]
-    u = sample_times / duration
-    s, ds_du = quintic_profile(u)
-
-    q_path = current_q[None, :] + s[:, None] * delta[None, :]
-    qd_path = (ds_du[:, None] / duration) * delta[None, :]
-
-    # Force the final point to the exact target and exact zero velocity.
-    q_path[-1] = current_q + delta
-    qd_path[-1] = 0.0
-
-    # Validate sampled joint positions and numerical velocity/acceleration.
-    validate_configuration(q_path[-1], "Final target")
-    if np.any(q_path < JOINT_LIMITS[:, 0]) or np.any(q_path > JOINT_LIMITS[:, 1]):
-        raise ValueError("Interpolated path crosses a configured joint limit.")
-
-    times_with_zero = np.concatenate(([0.0], sample_times))
-    q_with_zero = np.vstack((current_q, q_path))
-    if len(times_with_zero) >= 3:
-        qd_num = np.gradient(q_with_zero, times_with_zero, axis=0, edge_order=2)
-        qdd_num = np.gradient(qd_num, times_with_zero, axis=0, edge_order=2)
-        max_v = np.max(np.abs(qd_num), axis=0)
-        max_a = np.max(np.abs(qdd_num), axis=0)
-        # Check with a small numerical tolerance; analytical duration limits
-        # include a conservative margin and the exact quintic endpoint speeds.
-        if np.any(max_v > MAX_JOINT_VELOCITY * 1.08):
-            raise ValueError(f"Sampled velocity cap exceeded: {max_v}")
-        if np.any(max_a > MAX_JOINT_ACCELERATION * 1.15):
-            raise ValueError(f"Sampled acceleration cap exceeded: {max_a}")
-
-    return sample_times, q_path, qd_path, duration, delta
-
-
-class MoveToPoseNode(Node):
+class MoveToTargetNode(Node):
     def __init__(self):
-        super().__init__("move_to_fixed_joint_configuration")
-        self.latest_q: Optional[np.ndarray] = None
-        self.latest_stamp: Optional[float] = None
-        self.create_subscription(JointState, JOINT_STATE_TOPIC, self._joint_cb, 10)
-        self.arm_client = ActionClient(self, FollowJointTrajectory, ARM_ACTION)
-        self.torque_client = self.create_client(SetBool, TORQUE_SERVICE)
+        super().__init__("move_to_pose_sample_17_home")
+        self.current_q = None
+        self.last_joint_state_time = None
+        self.joint_state_count = 0
 
-    def enable_torque(self) -> None:
-        """Request torque ON before planning/execution; fail closed if unavailable."""
-        self.get_logger().info(f"Checking torque-enable service: {TORQUE_SERVICE}")
-        if not self.torque_client.wait_for_service(timeout_sec=TORQUE_SERVICE_TIMEOUT_S):
-            raise RuntimeError(
-                f"Torque service unavailable: {TORQUE_SERVICE}. "
-                "No trajectory will be sent. Check the Dynamixel hardware interface."
-            )
+        self.create_subscription(JointState, JOINT_STATE_TOPIC, self.joint_callback, 10)
+        self.torque_client = self.create_client(SetBool, TORQUE_SERVICE)
+        self.arm_client = ActionClient(self, FollowJointTrajectory, ARM_ACTION)
+
+    def joint_callback(self, msg: JointState):
+        if len(msg.name) != len(msg.position):
+            return
+        joint_map = dict(zip(msg.name, msg.position))
+        if not all(name in joint_map for name in JOINT_NAMES):
+            return
+        q = np.array([joint_map[name] for name in JOINT_NAMES], dtype=float)
+        if np.all(np.isfinite(q)):
+            self.current_q = q
+            self.last_joint_state_time = time.monotonic()
+            self.joint_state_count += 1
+
+    def enable_torque(self):
+        self.get_logger().info(f"Requesting torque ON through {TORQUE_SERVICE}")
+        if not self.torque_client.wait_for_service(timeout_sec=10.0):
+            raise RuntimeError(f"Torque service unavailable: {TORQUE_SERVICE}")
 
         request = SetBool.Request()
         request.data = True
         future = self.torque_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=TORQUE_SERVICE_TIMEOUT_S)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
         if not future.done():
-            raise TimeoutError(
-                f"Timed out requesting torque enable from {TORQUE_SERVICE}. "
-                "No trajectory will be sent."
-            )
+            raise RuntimeError("Timed out waiting for the torque-enable service.")
 
         response = future.result()
         if response is None:
-            raise RuntimeError(
-                f"No response from {TORQUE_SERVICE}. No trajectory will be sent."
-            )
+            raise RuntimeError("Torque-enable service returned no response.")
         if not response.success:
-            raise RuntimeError(
-                f"Torque enable was rejected: {response.message}. No trajectory will be sent."
-            )
+            raise RuntimeError(f"Torque enable failed: {response.message}")
+
         self.get_logger().info(
-            "Torque-enable request succeeded: " + (response.message or "torque ON requested")
+            f"Torque-enable request succeeded: {response.message or 'torque enabled'}"
         )
 
-    def _joint_cb(self, msg: JointState) -> None:
-        if len(msg.name) != len(msg.position):
-            return
-        values: Dict[str, float] = dict(zip(msg.name, msg.position))
-        if not all(name in values for name in JOINT_NAMES):
-            return
-        q = np.array([values[name] for name in JOINT_NAMES], dtype=float)
-        if np.all(np.isfinite(q)):
-            self.latest_q = q
-            self.latest_stamp = time.monotonic()
-
-    def get_fresh_joint_state(self) -> np.ndarray:
+    def get_fresh_joint_positions(self) -> np.ndarray:
         start = time.monotonic()
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self.latest_q is not None and self.latest_stamp is not None:
-                age = time.monotonic() - self.latest_stamp
-                if age <= JOINT_STATE_MAX_AGE_S:
-                    return validate_configuration(self.latest_q.copy(), "Measured current state")
-            if time.monotonic() - start > JOINT_STATE_TIMEOUT_S:
-                raise TimeoutError(
-                    f"No fresh four-joint state received from {JOINT_STATE_TOPIC} "
-                    f"within {JOINT_STATE_TIMEOUT_S:.1f} seconds."
+            if (
+                self.current_q is not None
+                and self.last_joint_state_time is not None
+                and time.monotonic() - self.last_joint_state_time <= JOINT_STATE_MAX_AGE
+            ):
+                return validate_joint_vector(self.current_q.copy(), "Measured current joints")
+            if time.monotonic() - start > JOINT_STATE_TIMEOUT:
+                raise RuntimeError(
+                    f"No fresh complete joint state received on {JOINT_STATE_TOPIC}."
                 )
         raise RuntimeError("ROS shutdown while waiting for joint states.")
 
-    def send_trajectory(self, sample_times, q_path, qd_path) -> None:
-        if not self.arm_client.wait_for_server(timeout_sec=10.0):
-            raise RuntimeError(f"Trajectory action server unavailable: {ARM_ACTION}")
+    def wait_until_target(self, target: np.ndarray):
+        start = time.monotonic()
+        consecutive_good = 0
+        last_count = self.joint_state_count
 
-        trajectory = JointTrajectory()
-        trajectory.joint_names = JOINT_NAMES
+        while rclpy.ok() and time.monotonic() - start < FINAL_POSITION_TIMEOUT:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.current_q is None or self.last_joint_state_time is None:
+                continue
+            if time.monotonic() - self.last_joint_state_time > JOINT_STATE_MAX_AGE:
+                continue
+            if self.joint_state_count == last_count:
+                continue
+            last_count = self.joint_state_count
 
-        for t, q, qd in zip(sample_times, q_path, qd_path):
+            error = np.abs(self.current_q - target)
+            if np.all(error <= FINAL_JOINT_TOLERANCE):
+                consecutive_good += 1
+                if consecutive_good >= 5:
+                    return self.current_q.copy(), error
+            else:
+                consecutive_good = 0
+
+        measured = None if self.current_q is None else self.current_q.copy()
+        if measured is None:
+            raise RuntimeError("No joint feedback received after trajectory execution.")
+        error = np.abs(measured - target)
+        raise RuntimeError(
+            "Trajectory action completed, but fresh joint feedback did not reach "
+            f"the commanded target within {FINAL_POSITION_TIMEOUT:.1f} s. "
+            f"Measured={np.round(measured, 5)}, "
+            f"absolute error={np.round(error, 5)} rad."
+        )
+
+    def send_trajectory(self, times, positions, velocities, accelerations):
+        self.get_logger().info(f"Waiting for trajectory action server: {ARM_ACTION}")
+        if not self.arm_client.wait_for_server(timeout_sec=ACTION_SERVER_TIMEOUT):
+            raise RuntimeError(f"Arm action server unavailable: {ARM_ACTION}")
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = JOINT_NAMES
+
+        for t, q, qd, qdd in zip(times, positions, velocities, accelerations):
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in q]
             point.velocities = [float(v) for v in qd]
-            sec = int(math.floor(float(t)))
-            nsec = int(round((float(t) - sec) * 1e9))
-            if nsec >= 1_000_000_000:
-                sec += 1
-                nsec -= 1_000_000_000
-            point.time_from_start = Duration(sec=sec, nanosec=nsec)
-            trajectory.points.append(point)
+            point.accelerations = [float(v) for v in qdd]
+            point.time_from_start = make_duration(float(t))
+            goal.trajectory.points.append(point)
 
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory = trajectory
-        goal.goal_time_tolerance = Duration(sec=int(GOAL_TIME_TOLERANCE_S))
-
-        self.get_logger().info("Sending joint-space trajectory to arm controller...")
         send_future = self.arm_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if not send_future.done():
+            raise RuntimeError("Timed out while submitting the arm trajectory.")
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Arm controller rejected the trajectory goal.")
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        wrapped = result_future.result()
-        if wrapped is None:
-            raise RuntimeError("Arm controller returned no trajectory result.")
-        result = wrapped.result
-        if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+        rclpy.spin_until_future_complete(
+            self, result_future, timeout_sec=ACTION_RESULT_TIMEOUT
+        )
+        if not result_future.done():
+            goal_handle.cancel_goal_async()
             raise RuntimeError(
-                f"Trajectory failed: error_code={result.error_code}, "
-                f"message='{result.error_string}'"
+                "Timed out waiting for trajectory completion; cancellation requested."
             )
-        self.get_logger().info("Target joint configuration reached successfully.")
+
+        wrapped_result = result_future.result()
+        if wrapped_result is None:
+            raise RuntimeError("Trajectory action returned no result.")
+        result = wrapped_result.result
+        if result.error_code != 0:
+            raise RuntimeError(
+                f"Trajectory action failed: error_code={result.error_code}, "
+                f"error_string='{result.error_string}'"
+            )
+        self.get_logger().info("Trajectory action reports successful completion.")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def print_joint_block(title: str, q: np.ndarray):
+    print(f"\n{title}")
+    for name, value in zip(JOINT_NAMES, q):
+        print(f"  {name}: {value:+.5f} rad ({np.rad2deg(value):+.2f} degrees)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Move OpenMANIPULATOR-X to the POSE SAMPLE 17 HOME TCP pose."
+    )
     parser.add_argument(
-        "--execute", action="store_true",
-        help="send the trajectory after an explicit MOVE confirmation (default: dry plan only)",
+        "--execute",
+        action="store_true",
+        help="Request Dynamixel torque ON and send the trajectory after confirmation.",
     )
     args = parser.parse_args()
 
-    target_q = validate_configuration(TARGET_Q, "Requested target")
+    print("POSE SAMPLE 17 reference joints:", np.round(REFERENCE_SAMPLE_Q, 5))
+    print("POSE SAMPLE 17 HOME XYZ (m):", np.round(HOME_XYZ, 5))
+    print(
+        f"Reference tool pitch: {HOME_TOOL_PITCH:.6f} rad "
+        f"({np.rad2deg(HOME_TOOL_PITCH):.3f} deg)"
+    )
+    print("Loaded kinematics joint limits:\n", JOINT_LIMITS)
+
     rclpy.init()
-    node = MoveToPoseNode()
+    node = MoveToTargetNode()
+
     try:
         if args.execute:
-            print("\nEXECUTION MODE: requesting Dynamixel torque ON before reading the start pose.")
+            print("\nEXECUTION MODE: requesting Dynamixel torque ON before reading start pose.")
             print("Keep hands clear. Enabling torque can make the arm hold or resist movement.")
             node.enable_torque()
-            # Discard any cached pre-enable sample and wait for fresh feedback.
-            node.latest_q = None
-            node.latest_stamp = None
+        else:
+            print("DRY-RUN MODE: no torque request and no arm movement will be commanded.")
 
-        current_q = node.get_fresh_joint_state()
-        sample_times, q_path, qd_path, duration, delta = plan_joint_trajectory(
-            current_q, target_q
+        current = node.get_fresh_joint_positions()
+        print_joint_block("CURRENT JOINT CONFIGURATION", current)
+
+        target, selected_pitch, target_description = resolve_legal_home_configuration(current)
+        print("\nSelected target:", target_description)
+        print(
+            f"Selected HOME tool pitch: {selected_pitch:.6f} rad "
+            f"({np.rad2deg(selected_pitch):.3f} deg); "
+            f"reference was {np.rad2deg(HOME_TOOL_PITCH):.3f} deg"
         )
+        print_joint_block("COMMAND TARGET JOINT CONFIGURATION", target)
+        print("FK of command target (m):", np.round(forward_pose(target), 5))
+        print("Requested HOME XYZ (m):", np.round(HOME_XYZ, 5))
+        print("Joint change (rad):", np.round(target - current, 5))
 
-        print("\nCURRENT JOINT CONFIGURATION (rad)")
-        for name, value in zip(JOINT_NAMES, current_q):
-            print(f"  {name}: {value:+.5f}")
-        print("\nTARGET JOINT CONFIGURATION (rad)")
-        for name, value in zip(JOINT_NAMES, target_q):
-            print(f"  {name}: {value:+.5f}")
-        print("\nPLANNED JOINT CHANGE (rad)")
-        for name, value in zip(JOINT_NAMES, delta):
-            print(f"  {name}: {value:+.5f}")
+        duration, times, positions, velocities, accelerations = quintic_trajectory(
+            current, target
+        )
         print(f"\nPlanned duration: {duration:.2f} s")
-        print(f"Trajectory samples: {len(q_path)} at up to {FREQUENCY_HZ:.0f} Hz")
+        print(f"Trajectory samples: {len(times)} at up to {FREQUENCY_HZ:.0f} Hz")
         print("Motion type: quintic joint-space interpolation")
+        print("Software velocity limits:", MAX_JOINT_VELOCITY, "rad/s")
+        print("Software acceleration limits:", MAX_JOINT_ACCELERATION, "rad/s^2")
         print("No collision checking is performed by this script.")
-        if args.execute:
-            print(f"Torque service: {TORQUE_SERVICE} (SetBool data=True requested)")
+        print(f"Torque service: {TORQUE_SERVICE}")
 
         if not args.execute:
-            print("\nDRY PLAN ONLY. No robot command was sent.")
-            print("After inspecting the workspace and planned move, rerun with --execute.")
-            print("Torque is not changed in dry-plan mode.")
+            print("DRY RUN: trajectory was planned but not sent.")
             return 0
 
-        print("\nBefore execution, verify the arm can move through the entire joint-space route.")
+        print("\nBefore execution, verify that the complete joint-space route is clear.")
         print("Keep the workspace clear and the emergency stop accessible.")
         if input("Type MOVE to send the trajectory: ").strip() != "MOVE":
-            print("Cancelled. No robot command was sent.")
+            print("Cancelled. No trajectory sent.")
             return 0
 
-        node.send_trajectory(sample_times, q_path, qd_path)
-        # Wait for measured joint feedback to converge; an action result alone
-        # does not prove that the physical joints reached the requested pose.
-        deadline = time.monotonic() + FINAL_STATE_TIMEOUT_S
-        final_q = node.get_fresh_joint_state()
-        final_error = float(np.max(np.abs(final_q - target_q)))
-        while final_error > FINAL_JOINT_TOLERANCE_RAD and time.monotonic() < deadline:
-            time.sleep(0.10)
-            final_q = node.get_fresh_joint_state()
-            final_error = float(np.max(np.abs(final_q - target_q)))
+        print("Sending joint-space trajectory to arm controller...")
+        node.send_trajectory(times, positions, velocities, accelerations)
 
-        print("Measured final joints:", np.round(final_q, 5))
-        print(f"Maximum final joint error: {final_error:.5f} rad")
-        if final_error > FINAL_JOINT_TOLERANCE_RAD:
-            raise RuntimeError(
-                "The trajectory action completed, but measured joints did not "
-                f"reach the target within {FINAL_JOINT_TOLERANCE_RAD:.2f} rad. "
-                "Check torque, controller state, motor errors, and joint feedback."
-            )
+        measured_final, final_error = node.wait_until_target(target)
+        print_joint_block("MEASURED FINAL JOINT CONFIGURATION", measured_final)
+        print(f"Maximum final joint error: {float(np.max(final_error)):.5f} rad")
+        print("Target HOME TCP pose reached successfully.")
         return 0
-    except Exception as exc:  # print a concise failure while ensuring ROS shutdown
-        print(f"\nERROR: {exc}", file=sys.stderr)
+
+    except Exception as exc:
+        print(f"\nERROR: {exc}")
+        print("No additional motion will be commanded.")
         return 1
     finally:
         node.destroy_node()
@@ -331,4 +571,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
