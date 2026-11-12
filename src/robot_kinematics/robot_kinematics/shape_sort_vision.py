@@ -82,10 +82,10 @@ ROBOT_MARKER_CORNERS_BY_ID = {
         [0.0830,  0.1200],  # BL (bottom-right of id=0 in camera view)
     ], dtype=np.float32),
     4: np.array([
-        [0.1127, -0.1243],  # TL (top-left of id=4 in camera view)
-        [0.0777, -0.1249],  # TR (top-right of id=4 in camera view)
-        [0.0763, -0.0848],  # BR (bottom-right of id=4 in camera view)
-        [0.1166, -0.0910],  # BL (bottom-left of id=4 in camera view)
+        [0.1291, -0.1288],  # TL (top-left of id=4 in camera view)
+        [0.0967, -0.1324],  # TR (top-right of id=4 in camera view)
+        [0.0904, -0.0901],  # BR (bottom-right of id=4 in camera view)
+        [0.1261, -0.0916],  # BL (bottom-left of id=4 in camera view)
     ], dtype=np.float32),
 }
 
@@ -99,16 +99,16 @@ ROBOT_MARKER_CORNERS = np.vstack([
 # used to initialize and persist the remembered 8-point homography.
 DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
     0: np.array([
-        [469.4, 337.5],
-        [459.1, 291.7],
-        [505.8, 286.4],
-        [515.1, 330.9],
+        [485.6, 360.5],
+        [476.9, 316.5],
+        [522.4, 310.8],
+        [530.9, 355.5],
     ], dtype=np.float32),
     4: np.array([
-        [418.4,  17.6],
-        [456.6,  16.5],
-        [462.7,  55.2],
-        [421.1,  60.2],
+        [421.0,  51.0],
+        [457.3,  41.8],
+        [466.7,  80.7],
+        [426.6,  86.6],
     ], dtype=np.float32),
 }
 
