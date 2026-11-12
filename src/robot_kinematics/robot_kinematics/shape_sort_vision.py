@@ -130,6 +130,37 @@ ARUCO_MIN_AREA_PX = 80.0
 ARUCO_CORNER_SMOOTHING_ALPHA = 0.35
 ARUCO_MAX_CORNER_JUMP_PX = 25.0
 
+# ----------------- ROBOT COORDINATE OFFSETS -----------------
+# Offsets applied to mapped robot base_link coordinates (in metres).
+# Negative X pulls the target closer to the robot base.
+# Positive X pushes the target further away from the robot base.
+# Negative Y shifts to the robot's right.
+# Positive Y shifts to the robot's left.
+#
+# Default placing offset: reduce calculated placing coordinate by 3 cm (-0.030 m) for all shapes.
+# Easily changed here or overridden from command line via environment variable:
+#   SHAPE_SORT_PLACE_OFFSET_X=-0.030 python3 run_shape_sorting.py
+PLACE_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_X", "-0.030"))  # -3.0 cm
+PLACE_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_Y", "0.000"))   #  0.0 cm
+
+PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.000"))
+PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))
+
+# Per-shape placing offsets [dX, dY] (metres). Modify any shape individually if needed:
+PER_SHAPE_PLACE_OFFSETS = {
+    "green_circle":    np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+    "orange_hexagon":  np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+    "blue_square":     np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+    "yellow_triangle": np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+}
+
+PER_SHAPE_PICK_OFFSETS = {
+    "green_circle":    np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64),
+    "orange_hexagon":  np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64),
+    "blue_square":     np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64),
+    "yellow_triangle": np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64),
+}
+
 
 # ------------------------- OBJECT CLASSES -------------------------
 SHAPE_ORDER = ("green_circle", "blue_square", "orange_hexagon", "yellow_triangle")
@@ -2055,6 +2086,11 @@ def main():
         "place pixels use the 8-corner dual-ArUco homography (with persistent fallback).",
         flush=True,
     )
+    print(
+        f"Placing coordinate offset applied: dX={PLACE_OFFSET_X_M * 1000:+.1f} mm ({PLACE_OFFSET_X_M * 100:+.1f} cm), "
+        f"dY={PLACE_OFFSET_Y_M * 1000:+.1f} mm",
+        flush=True,
+    )
     camera = open_camera()
     try:
         ok, first_frame = camera.read()
@@ -2185,12 +2221,17 @@ def main():
                             hp = holes[name]["center_px"]
                             data[name]["pick_pixel"].append(np.asarray(pp, float))
                             data[name]["place_pixel"].append(np.asarray(hp, float))
-                            data[name]["pick_robot"].append(
-                                object_pixel_to_robot_xy(pp, marker_H, shape_name=name)
+                            pick_rob = object_pixel_to_robot_xy(pp, marker_H, shape_name=name)
+                            pick_offset = PER_SHAPE_PICK_OFFSETS.get(
+                                name, np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64)
                             )
-                            data[name]["place_robot"].append(
-                                pixel_to_robot_xy(hp, marker_H)
+                            data[name]["pick_robot"].append(pick_rob + pick_offset)
+
+                            place_rob = pixel_to_robot_xy(hp, marker_H)
+                            place_offset = PER_SHAPE_PLACE_OFFSETS.get(
+                                name, np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64)
                             )
+                            data[name]["place_robot"].append(place_rob + place_offset)
                 last_counts = {n: len(data[n]["pick_robot"]) for n in SHAPE_ORDER}
                 elapsed = time.monotonic() - start
 

@@ -62,9 +62,9 @@ TASK_TOOL_ANGLE = float(np.deg2rad(45.0))
 # TCP position recorded for POSE SAMPLE 17 (metres).
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
-PICK_CONTACT_Z = 0.060
-PLACE_CONTACT_Z = 0.060
-TRAVEL_Z = 0.140                 # 14 cm clearance plane ensures far holes are within kinematic reach
+PICK_CONTACT_Z = 0.090          # Lowest pick contact height (raised by 3 cm from 0.060 m)
+PLACE_CONTACT_Z = float(os.environ.get("PLACE_CONTACT_Z", "0.100"))  # Lowest place contact height (0.100 m = +4 cm from baseline 0.060 m)
+TRAVEL_Z = 0.140
 PLACE_RETRACT_Z = 0.160          # 16 cm vertical retract after placing
 MIN_TRANSFER_Z = 0.120            # Hard floor for non-contact travel.
 
@@ -104,20 +104,39 @@ SORT_SHAPES = (
     "yellow_triangle",
 )
 
-# GripperCommand positions are in metres. Verify direction with a gripper-only test.
-GRIPPER_OPEN_POSITION = -0.00944
+# Revolute-to-prismatic mapping configured in ros2_control xacro:
+#   revolute_min = 0.92 rad  -> prismatic_min = -0.010 m
+#   revolute_max = -1.52 rad -> prismatic_max = +0.019 m
+# prismatic = slope * revolute + intercept
+REVOLUTE_TO_PRISMATIC_SLOPE = (0.019 - (-0.010)) / (-1.52 - 0.92)  # -0.011885246 m/rad
+REVOLUTE_TO_PRISMATIC_INTERCEPT = -0.010 - REVOLUTE_TO_PRISMATIC_SLOPE * 0.92  # 0.000934426 m
+
+def dxl5_to_prismatic(dxl5_rad: float) -> float:
+    """Convert dxl5 raw motor radians to GripperCommand prismatic position (metres)."""
+    return float(REVOLUTE_TO_PRISMATIC_SLOPE * float(dxl5_rad) + REVOLUTE_TO_PRISMATIC_INTERCEPT)
+
+# Raw dxl5 motor interface units (rad) calibrated on physical hardware:
+#   Open gripper (default): -0.93 rad -> +0.01199 m
+#   Grip position for all shapes: +0.46 rad -> -0.00453 m
+DXL5_OPEN_POSITION_RAD = -0.93
+DXL5_COMMON_GRIP_RAD = 0.46
+DXL5_GRIP_POSITIONS_RAD = {
+    "blue_square": DXL5_COMMON_GRIP_RAD,
+    "green_circle": DXL5_COMMON_GRIP_RAD,
+    "orange_hexagon": DXL5_COMMON_GRIP_RAD,
+    "yellow_triangle": DXL5_COMMON_GRIP_RAD,
+}
+
+GRIPPER_OPEN_POSITION = dxl5_to_prismatic(DXL5_OPEN_POSITION_RAD)
 GRIPPER_MAX_SEPARATION_POSITION = GRIPPER_OPEN_POSITION
-GRIPPER_CLOSED_POSITION = 0.010
-GRIPPER_DEFAULT_GRIP_POSITION = 0.0025
+GRIPPER_CLOSED_POSITION = -0.00944
+GRIPPER_DEFAULT_GRIP_POSITION = dxl5_to_prismatic(DXL5_COMMON_GRIP_RAD)
 GRIPPER_MAX_EFFORT = 20.0
 
 # Per-shape grip positions (in metres, sent to GripperCommand position).
-# Measured from physical block grasp tests via record_joint_poses.py:
 GRIP_POSITIONS_BY_SHAPE = {
-    "blue_square": 0.00108,
-    "green_circle": 0.00090,
-    "orange_hexagon": 0.00354,
-    "yellow_triangle": 0.00600,
+    shape: dxl5_to_prismatic(rad)
+    for shape, rad in DXL5_GRIP_POSITIONS_RAD.items()
 }
 
 # Live execution on hardware (DRY_RUN disabled)
@@ -825,6 +844,15 @@ def load_sort_targets():
     for index, name in enumerate(labels):
         if np.linalg.norm(targets[index, 0] - targets[index, 1]) < 0.005:
             raise ValueError(f"{name}: pick and place coordinates are less than 5 mm apart.")
+
+    # Optional controller-level offset override (if running controller standalone without re-running vision)
+    ctrl_dx = float(os.environ.get("CONTROLLER_PLACE_OFFSET_X", "0.000"))
+    ctrl_dy = float(os.environ.get("CONTROLLER_PLACE_OFFSET_Y", "0.000"))
+    if ctrl_dx != 0.0 or ctrl_dy != 0.0:
+        targets[:, 1, 0] += ctrl_dx
+        targets[:, 1, 1] += ctrl_dy
+        print(f"[OFFSET] Applied runtime place offset: dX={ctrl_dx * 1000:+.1f} mm, dY={ctrl_dy * 1000:+.1f} mm", flush=True)
+
     return targets, labels
 
 
@@ -873,13 +901,10 @@ def preflight_entire_sequence(targets, labels, start_q):
             place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
 
-        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
-
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
         place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
-        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
 
         print(f"\n[PRE-FLIGHT] {name}: approach to pick height (pitch={np.rad2deg(pick_above_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
@@ -922,6 +947,8 @@ def preflight_entire_sequence(targets, labels, start_q):
             goal_tool_angle=place_contact_pitch,
         )
 
+        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
+        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
         print(f"[PRE-FLIGHT] {name}: retract after release to 16cm (pitch {np.rad2deg(place_contact_pitch):.1f} -> {np.rad2deg(place_retract_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, place_retract, f"{name} post-place retract", VERTICAL_DURATION,
@@ -1073,13 +1100,10 @@ def run_sequence(node):
             place_xy, PLACE_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
         )
 
-        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
-
         pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
         pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
         place_contact = np.array([place_xy[0], place_xy[1], PLACE_CONTACT_Z], dtype=float)
-        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
 
         print(f"\n========== {index + 1}/{len(labels)}: {name} ==========")
         print(
@@ -1142,7 +1166,9 @@ def run_sequence(node):
             f"open after placing {name}",
         )
 
-        # Retract after placement vertically to 16cm
+        # Retract after placement
+        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
+        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
         try:
             current_q = plan_and_execute_to(
                 node, current_q, place_retract,
