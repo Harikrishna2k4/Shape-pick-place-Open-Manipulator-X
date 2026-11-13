@@ -42,15 +42,51 @@ JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4"]
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 TARGET_Q = np.array([-0.13346, -1.29315, 0.04142, 2.02485], dtype=float)
 
-# Gripper target position in metres:
-# Physical mapping observed on hardware:
-#   Open gripper:   +0.010 m
-#   Closed gripper: -0.00944 m
-TARGET_GRIPPER_POSITION = float(os.environ.get("GRIPPER_OPEN_POS", "0.010"))
+# Gripper configuration (dxl5 / ID 15):
+# Primary home angle: 145.5 degrees
+# Physical calibration from DYNAMIXEL Wizard 2.0:
+#   Open / Home angle: 145.5 deg -> maps to -0.010 m prismatic
+#   Closed max angle:  210.0 deg -> maps to +0.019 m prismatic
+GRIPPER_HOME_ANGLE_DEG = float(os.environ.get("GRIPPER_HOME_ANGLE_DEG", "145.5"))
+GRIPPER_CLOSED_MAX_DEG = float(os.environ.get("GRIPPER_MAX_CLOSE_DEG", "210.0"))
 GRIPPER_MAX_EFFORT = 20.0
 
+
+def angle_deg_to_prismatic(deg: float) -> float:
+    """Map physical motor degrees [145.5, 210.0] linearly to ROS 2 prismatic metres [-0.010, 0.019]."""
+    fraction = (deg - GRIPPER_HOME_ANGLE_DEG) / (GRIPPER_CLOSED_MAX_DEG - GRIPPER_HOME_ANGLE_DEG)
+    return float(-0.010 + fraction * (0.019 - (-0.010)))
+
+
+def prismatic_to_angle_deg(pris: float) -> float:
+    """Map ROS 2 prismatic metres [-0.010, 0.019] linearly to physical motor degrees [145.5, 210.0]."""
+    fraction = (pris - (-0.010)) / (0.019 - (-0.010))
+    return float(GRIPPER_HOME_ANGLE_DEG + fraction * (GRIPPER_CLOSED_MAX_DEG - GRIPPER_HOME_ANGLE_DEG))
+
+
+def parse_gripper_target(val) -> tuple:
+    """Parse gripper target returning (deg, prismatic_m).
+
+    Accepts degrees (e.g. 145.5) or prismatic metres (e.g. -0.010).
+    """
+    v = float(val)
+    if abs(v) > 1.0:  # Value is in degrees (e.g. 145.5 deg)
+        deg = v
+        pris = angle_deg_to_prismatic(deg)
+    else:  # Value is in prismatic metres (e.g. -0.010 m)
+        pris = v
+        deg = prismatic_to_angle_deg(pris)
+    return deg, pris
+
+
 def dxl5_to_prismatic(dxl5_rad: float) -> float:
+    """Pass-through/helper for compatibility."""
     return float(dxl5_rad)
+
+
+# Target gripper home position:
+_env_grip = os.environ.get("GRIPPER_HOME_ANGLE_DEG") or os.environ.get("GRIPPER_OPEN_POS") or "145.5"
+TARGET_GRIPPER_DEG, TARGET_GRIPPER_POSITION = parse_gripper_target(_env_grip)
 
 # ROS communication endpoints
 JOINT_STATE_TOPIC = "/joint_states"
@@ -243,11 +279,15 @@ class GotoHomeNode(Node):
         if not self.gripper_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(f"Gripper action server unavailable: {GRIPPER_ACTION}")
 
+        deg_val, pris_val = parse_gripper_target(position)
+
         goal = GripperCommand.Goal()
-        goal.command.position = float(position)
+        goal.command.position = float(pris_val)
         goal.command.max_effort = float(GRIPPER_MAX_EFFORT)
 
-        self.get_logger().info(f"Sending gripper goal: {position:.5f} ({label})...")
+        self.get_logger().info(
+            f"Sending gripper goal: {deg_val:.1f}° ({pris_val:+.5f} m) ({label})..."
+        )
         send_future = self.gripper_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
         goal_handle = send_future.result()
@@ -271,7 +311,10 @@ class GotoHomeNode(Node):
                 f"stalled={res.stalled}, position={res.position:.5f}"
             )
 
-        self.get_logger().info(f"Gripper execution completed ({label}): position={res.position:.5f}")
+        res_deg, _ = parse_gripper_target(res.position)
+        self.get_logger().info(
+            f"Gripper execution completed ({label}): {res_deg:.1f}° (position={res.position:.5f} m)"
+        )
         return res.position
 
 
@@ -280,7 +323,7 @@ def main():
     print("OpenMANIPULATOR-X: Goto Home")
     print(f"Target HOME_XYZ:        {HOME_XYZ} m")
     print(f"Target Joints:          {np.round(TARGET_Q, 5)} rad")
-    print(f"Target Gripper (dxl5):  {TARGET_GRIPPER_POSITION:+.5f} (open)")
+    print(f"Target Gripper:         {TARGET_GRIPPER_DEG:.1f}° ({TARGET_GRIPPER_POSITION:+.5f} m, home)")
     print("=" * 60)
 
     rclpy.init()
@@ -294,9 +337,11 @@ def main():
         current_q = node.get_current_joints()
         print(f"Current Joints:         {np.round(current_q, 5)} rad")
         if node.current_dxl5 is not None:
-            print(f"Current dxl5 motor:     {node.current_dxl5:+.5f} (raw units)")
+            cur_deg, _ = parse_gripper_target(node.current_dxl5)
+            print(f"Current dxl5 motor:     {cur_deg:.1f}° ({node.current_dxl5:+.5f} raw)")
         elif node.current_gripper is not None:
-            print(f"Current Gripper:        {node.current_gripper:+.5f} m")
+            cur_deg, _ = parse_gripper_target(node.current_gripper)
+            print(f"Current Gripper:        {cur_deg:.1f}° ({node.current_gripper:+.5f} m)")
         cur_xyz, _, _ = forward_kinematics(*current_q)
         print(f"Current XYZ:            {np.round(cur_xyz, 5)} m")
 
@@ -309,9 +354,9 @@ def main():
         # 4. Execute trajectory immediately
         node.execute_trajectory(times, positions, velocities, accelerations)
 
-        # 5. Command gripper joint to open target position (-0.00944 m = open)
-        print(f"\nMoving gripper to open position ({TARGET_GRIPPER_POSITION:+.5f} m)...")
-        node.command_gripper(TARGET_GRIPPER_POSITION, label="open gripper")
+        # 5. Command gripper joint to primary home angle (145.5 deg -> -0.010 m)
+        print(f"\nMoving gripper to home position: {TARGET_GRIPPER_DEG:.1f}° ({TARGET_GRIPPER_POSITION:+.5f} m)...")
+        node.command_gripper(TARGET_GRIPPER_POSITION, label=f"home gripper {TARGET_GRIPPER_DEG:.1f}°")
 
         # 6. Confirm final position
         final_q = node.get_current_joints()
@@ -320,9 +365,11 @@ def main():
         print("\nReached Target Position:")
         print(f"Final Joints:           {np.round(final_q, 5)} rad")
         if node.current_dxl5 is not None:
-            print(f"Final dxl5 motor:       {node.current_dxl5:+.5f} (raw units)")
+            cur_deg, _ = parse_gripper_target(node.current_dxl5)
+            print(f"Final dxl5 motor:       {cur_deg:.1f}° ({node.current_dxl5:+.5f} raw)")
         elif node.current_gripper is not None:
-            print(f"Final Gripper:          {node.current_gripper:+.5f} m")
+            cur_deg, _ = parse_gripper_target(node.current_gripper)
+            print(f"Final Gripper:          {cur_deg:.1f}° ({node.current_gripper:+.5f} m)")
         print(f"Final XYZ:              {np.round(final_xyz, 5)} m")
         print(f"Joint Error:            {np.round(np.abs(final_q - TARGET_Q), 5)} rad")
         print("=" * 60)

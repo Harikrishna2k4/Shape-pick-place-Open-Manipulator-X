@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 # ---------------------------- CAMERA -----------------------------
-CAMERA_DEVICE = "/dev/video4"
+CAMERA_DEVICE = os.environ.get("SHAPE_SORT_CAMERA", "/dev/video6")
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 FPS = 30
@@ -73,8 +73,31 @@ MARKER_SIDE_M = 0.037         # physical outer-edge-to-outer-edge side length (m
 CALIBRATED_HOMOGRAPHY_FILE = SCRIPT_DIR / "calibrated_homography.npz"
 
 # Corner order MUST match OpenCV's detected ArUco order: TL, TR, BR, BL.
-# These are measured TCP/FK robot base_link coordinates, in metres.
-ROBOT_MARKER_CORNERS_BY_ID = {
+# Physical marker corners regularized to exact physical 37.0 mm x 37.0 mm squares (equal sides, 90 deg corners)
+def regularize_square_corners(raw_corners, target_side=None):
+    """Force detected or reference corners of an ArUco quad to be a true geometric square with equal sides and 90° corners."""
+    raw = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
+    center, (w, h), angle = cv2.minAreaRect(raw)
+    side = float(target_side) if target_side is not None else float(
+        np.mean([np.linalg.norm(raw[(i + 1) % 4] - raw[i]) for i in range(4)])
+    )
+    square_box = cv2.boxPoints((center, (side, side), angle)).astype(np.float32)
+
+    # Strictly preserve corner ordering (TL, TR, BR, BL)
+    ordered = np.zeros_like(square_box)
+    used = set()
+    for i in range(4):
+        dists = [
+            np.linalg.norm(square_box[j] - raw[i]) if j not in used else 1e9
+            for j in range(4)
+        ]
+        best_j = int(np.argmin(dists))
+        ordered[i] = square_box[best_j]
+        used.add(best_j)
+    return ordered
+
+
+RAW_ROBOT_MARKER_CORNERS_BY_ID = {
     0: np.array([
         [0.1210,  0.1310],  # TL (bottom-left of id=0 in camera view)
         [0.1170,  0.0920],  # TR (top-left of id=0 in camera view)
@@ -82,11 +105,16 @@ ROBOT_MARKER_CORNERS_BY_ID = {
         [0.0830,  0.1200],  # BL (bottom-right of id=0 in camera view)
     ], dtype=np.float32),
     4: np.array([
-        [0.1291, -0.1288],  # TL (top-left of id=4 in camera view)
-        [0.0967, -0.1324],  # TR (top-right of id=4 in camera view)
-        [0.0904, -0.0901],  # BR (bottom-right of id=4 in camera view)
-        [0.1261, -0.0916],  # BL (bottom-left of id=4 in camera view)
+        [0.0933, -0.0911],  # TL in OpenCV detection
+        [0.1295, -0.0917],  # TR in OpenCV detection
+        [0.1292, -0.1285],  # BR in OpenCV detection
+        [0.0943, -0.1278],  # BL in OpenCV detection
     ], dtype=np.float32),
+}
+
+ROBOT_MARKER_CORNERS_BY_ID = {
+    mid: regularize_square_corners(corners, target_side=MARKER_SIDE_M)
+    for mid, corners in RAW_ROBOT_MARKER_CORNERS_BY_ID.items()
 }
 
 # Backwards-compatible alias for metadata/logging (all 8 corners stacked).
@@ -97,32 +125,41 @@ ROBOT_MARKER_CORNERS = np.vstack([
 
 # Pre-calibrated reference image corners for IDs 0 and 4 from the live camera,
 # used to initialize and persist the remembered 8-point homography.
-DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
+RAW_DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
     0: np.array([
-        [485.6, 360.5],
-        [476.9, 316.5],
-        [522.4, 310.8],
-        [530.9, 355.5],
+        [386.4, 357.7],
+        [378.8, 309.8],
+        [427.4, 310.5],
+        [431.8, 355.3],
     ], dtype=np.float32),
     4: np.array([
-        [421.0,  51.0],
-        [457.3,  41.8],
-        [466.7,  80.7],
-        [426.6,  86.6],
+        [388.6,  79.4],
+        [347.6,  82.3],
+        [345.2,  46.8],
+        [383.2,  39.7],
     ], dtype=np.float32),
 }
 
+DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
+    mid: corners.copy()
+    for mid, corners in RAW_DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID.items()
+}
+
 # 3D object height parallax compensation:
-# Because the camera views the metal plate obliquely from nadir ~(383, 290.5)
-# and the 3D blocks have height above the table plane (where the ArUco markers
-# lie), an object's top face projects away from the camera nadir. Shifting the
-# top-face pixel towards the nadir recovers the true table-plane base center.
+# When objects are far from the assumed camera nadir (especially near the robot base),
+# applying full parallax displacement factors (0.12 - 0.22) artificially shifts the
+# pick target by ~18 to 20 mm in X and up to ~29 mm laterally in Y, which produces
+# the observed ~2 cm offset when picking shapes near the base.
+#
+# Defaults to 0.0 (disabled, pure homography mapping). Set SHAPE_SORT_PARALLAX_SCALE
+# to a non-zero value if slight partial correction is ever needed.
+PARALLAX_SCALE = float(os.environ.get("SHAPE_SORT_PARALLAX_SCALE", "0.0"))
 CAMERA_NADIR_PX = np.array([383.0, 290.5], dtype=np.float64)
 OBJECT_PARALLAX_FACTORS = {
-    "green_circle":    np.array([0.155, 0.220], dtype=np.float64),
-    "blue_square":     np.array([0.120, 0.160], dtype=np.float64),
-    "orange_hexagon":  np.array([0.120, 0.160], dtype=np.float64),
-    "yellow_triangle": np.array([0.120, 0.160], dtype=np.float64),
+    "green_circle":    np.array([0.155, 0.220], dtype=np.float64) * PARALLAX_SCALE,
+    "blue_square":     np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
+    "orange_hexagon":  np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
+    "yellow_triangle": np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
 }
 
 ARUCO_CORNER_LABELS = ("TL", "TR", "BR", "BL")
@@ -134,22 +171,24 @@ ARUCO_MAX_CORNER_JUMP_PX = 25.0
 # Offsets applied to mapped robot base_link coordinates (in metres).
 # Negative X pulls the target closer to the robot base.
 # Positive X pushes the target further away from the robot base.
-# Negative Y shifts to the robot's right.
-# Positive Y shifts to the robot's left.
+# Negative Y shifts to the robot's right (upside in camera viewport).
+# Positive Y shifts to the robot's left (downside in camera viewport).
 #
-# Default placing offset: reduce calculated placing coordinate by 3 cm (-0.030 m) for all shapes.
-# Easily changed here or overridden from command line via environment variable:
-#   SHAPE_SORT_PLACE_OFFSET_X=-0.030 python3 run_shape_sorting.py
-PLACE_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_X", "-0.030"))  # -3.0 cm
+# All offsets removed (set to 0.0 m) by user request:
+PLACE_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_X", "0.000"))   #  0.0 cm
 PLACE_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_Y", "0.000"))   #  0.0 cm
 
-PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.000"))
-PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))
+BOTTOM_SHAPES_PLACE_OFFSET_Y_M = float(
+    os.environ.get("SHAPE_SORT_BOTTOM_PLACE_OFFSET_Y", "0.000")
+)  # 0.0 cm
 
-# Per-shape placing offsets [dX, dY] (metres). Modify any shape individually if needed:
+PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.000"))     #  0.0 cm
+PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))     #  0.0 cm
+
+# Per-shape placing offsets [dX, dY] (metres):
 PER_SHAPE_PLACE_OFFSETS = {
-    "green_circle":    np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
-    "orange_hexagon":  np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+    "green_circle":    np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
+    "orange_hexagon":  np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
     "blue_square":     np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
     "yellow_triangle": np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
 }
@@ -276,10 +315,10 @@ MIN_CARDBOARD_FRACTION = 0.02          # strip must cover >= 2% of the frame
 # The cardboard strip is in the central-left task area in the current camera
 # setup. Restricting the search to this region prevents table/floor colours
 # outside the task area from becoming a false cardboard component.
-CARDBOARD_SEARCH_X = (0.20, 0.75)       # current board spans the centre of this camera view
+CARDBOARD_SEARCH_X = (0.15, 0.85)       # search zone covering wherever the cardboard strip is placed
 CARDBOARD_SEARCH_Y = (0.00, 1.00)       # fractions of frame height
-CARDBOARD_RECT_ASPECT = (0.12, 0.45)    # short side / long side of the strip
-CARDBOARD_CENTER_X_RANGE = (0.30, 0.65) # expected strip centre, as frame-width fractions
+CARDBOARD_RECT_ASPECT = (0.12, 0.32)    # physical strip is narrow: 9 cm x 40 cm -> aspect ~0.21
+CARDBOARD_CENTER_X_RANGE = (0.22, 0.72) # flexible center range accommodating strip placement
 
 # Temporal stabilisation for the board and detected centres.
 BOARD_FRAME_HISTORY = 7          # frames averaged before each board update
@@ -323,8 +362,37 @@ def make_aruco_detector():
     else:
         parameters = aruco.DetectorParameters_create()
 
-    if hasattr(aruco, "CORNER_REFINE_SUBPIX"):
+    # Use contour-based edge refinement for straight, accurate square edges
+    # (resists glare and specular reflections on metallic plates)
+    if hasattr(aruco, "CORNER_REFINE_CONTOUR"):
+        parameters.cornerRefinementMethod = aruco.CORNER_REFINE_CONTOUR
+    elif hasattr(aruco, "CORNER_REFINE_SUBPIX"):
         parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+
+    if hasattr(parameters, "cornerRefinementWinSize"):
+        parameters.cornerRefinementWinSize = 4
+    if hasattr(parameters, "cornerRefinementMaxIterations"):
+        parameters.cornerRefinementMaxIterations = 40
+    if hasattr(parameters, "cornerRefinementMinAccuracy"):
+        parameters.cornerRefinementMinAccuracy = 0.05
+
+    # Multi-scale fine adaptive thresholding for robust edge extraction
+    if hasattr(parameters, "adaptiveThreshWinSizeMin"):
+        parameters.adaptiveThreshWinSizeMin = 3
+    if hasattr(parameters, "adaptiveThreshWinSizeMax"):
+        parameters.adaptiveThreshWinSizeMax = 41
+    if hasattr(parameters, "adaptiveThreshWinSizeStep"):
+        parameters.adaptiveThreshWinSizeStep = 3
+    if hasattr(parameters, "adaptiveThreshConstant"):
+        parameters.adaptiveThreshConstant = 7.0
+    if hasattr(parameters, "polygonalApproxAccuracyRate"):
+        parameters.polygonalApproxAccuracyRate = 0.02
+    if hasattr(parameters, "minMarkerPerimeterRate"):
+        parameters.minMarkerPerimeterRate = 0.02
+    if hasattr(parameters, "maxMarkerPerimeterRate"):
+        parameters.maxMarkerPerimeterRate = 4.0
+    if hasattr(parameters, "minDistanceToBorder"):
+        parameters.minDistanceToBorder = 1
 
     if hasattr(aruco, "ArucoDetector"):
         detector = aruco.ArucoDetector(dictionary, parameters)
@@ -334,13 +402,26 @@ def make_aruco_detector():
     return detector, dictionary, parameters
 
 
-def _valid_homography(H):
-    return (
-        H is not None
-        and getattr(H, "shape", None) == (3, 3)
-        and np.all(np.isfinite(H))
-        and abs(float(np.linalg.det(H))) >= 1e-12
-    )
+def _valid_homography(H, width=IMAGE_WIDTH, height=IMAGE_HEIGHT):
+    if (
+        H is None
+        or getattr(H, "shape", None) != (3, 3)
+        or not np.all(np.isfinite(H))
+        or abs(float(np.linalg.det(H))) < 1e-12
+    ):
+        return False
+    # Ensure projective denominator does not vanish anywhere inside the camera image
+    test_pts = np.array([
+        [0.0, 0.0],
+        [float(width), 0.0],
+        [float(width), float(height)],
+        [0.0, float(height)],
+        [float(width) / 2.0, float(height) / 2.0],
+    ], dtype=np.float64)
+    w = H[2, 0] * test_pts[:, 0] + H[2, 1] * test_pts[:, 1] + H[2, 2]
+    if np.any(np.abs(w) < 0.1) or not (np.all(w > 0) or np.all(w < 0)):
+        return False
+    return True
 
 
 def compute_homography_from_corner_map(corners_by_id):
@@ -425,21 +506,46 @@ def detect_aruco_markers_in_frame(frame, detector, dictionary, parameters):
         )
 
     detected = {}
-    if ids is None or len(ids) == 0:
-        return detected
+    if ids is not None and len(ids) > 0:
+        for raw_corners, marker_id_arr in zip(corners, ids.flatten()):
+            marker_id = int(marker_id_arr)
+            if marker_id not in ROBOT_MARKER_CORNERS_BY_ID:
+                continue
+            image_corners = raw_corners.reshape(4, 2).astype(np.float32)
+            if not np.all(np.isfinite(image_corners)):
+                continue
+            marker_area = abs(float(cv2.contourArea(image_corners)))
+            if marker_area < ARUCO_MIN_AREA_PX:
+                continue
+            # Force detected marker corners to be equal-sided and square (90-deg corners)
+            square_corners = regularize_square_corners(image_corners)
+            if marker_id not in detected or marker_area > detected[marker_id][1]:
+                detected[marker_id] = (square_corners, marker_area)
 
-    for raw_corners, marker_id_arr in zip(corners, ids.flatten()):
-        marker_id = int(marker_id_arr)
-        if marker_id not in ROBOT_MARKER_CORNERS_BY_ID:
-            continue
-        image_corners = raw_corners.reshape(4, 2).astype(np.float32)
-        if not np.all(np.isfinite(image_corners)):
-            continue
-        marker_area = abs(float(cv2.contourArea(image_corners)))
-        if marker_area < ARUCO_MIN_AREA_PX:
-            continue
-        if marker_id not in detected or marker_area > detected[marker_id][1]:
-            detected[marker_id] = (image_corners, marker_area)
+    # Secondary CLAHE pass if any calibration marker was missed (e.g. glare on metal table)
+    if len(detected) < len(ROBOT_MARKER_CORNERS_BY_ID):
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_enhanced = clahe.apply(gray)
+        if detector is not None:
+            c_e, ids_e, _ = detector.detectMarkers(gray_enhanced)
+        else:
+            c_e, ids_e, _ = cv2.aruco.detectMarkers(
+                gray_enhanced, dictionary, parameters=parameters
+            )
+        if ids_e is not None and len(ids_e) > 0:
+            for raw_corners, marker_id_arr in zip(c_e, ids_e.flatten()):
+                marker_id = int(marker_id_arr)
+                if marker_id not in ROBOT_MARKER_CORNERS_BY_ID or marker_id in detected:
+                    continue
+                image_corners = raw_corners.reshape(4, 2).astype(np.float32)
+                if not np.all(np.isfinite(image_corners)):
+                    continue
+                marker_area = abs(float(cv2.contourArea(image_corners)))
+                if marker_area < ARUCO_MIN_AREA_PX:
+                    continue
+                # Force detected marker corners to be equal-sided and square (90-deg corners)
+                square_corners = regularize_square_corners(image_corners)
+                detected[marker_id] = (square_corners, marker_area)
 
     return {mid: item[0] for mid, item in detected.items()}
 
@@ -525,11 +631,13 @@ def update_aruco_homography(frame, detector, dictionary, parameters, state, reme
     return None, {}, "ARUCO NOT DETECTED & no remembered homography"
 
 
-def open_camera():
-    camera = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+def open_camera(device_path=None):
+    target_device = device_path or os.environ.get("SHAPE_SORT_CAMERA", CAMERA_DEVICE)
+    camera = cv2.VideoCapture(target_device, cv2.CAP_V4L2)
     if not camera.isOpened():
         camera.release()
-        raise RuntimeError(f"Cannot open camera {CAMERA_DEVICE}.")
+        raise RuntimeError(f"Cannot open camera {target_device}.")
+
     if USE_YUYV:
         camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
@@ -537,6 +645,8 @@ def open_camera():
     camera.set(cv2.CAP_PROP_FPS, FPS)
     for _ in range(25):
         camera.read()
+
+    print(f"[CAMERA] Opened {target_device} ({IMAGE_WIDTH}x{IMAGE_HEIGHT} @ {FPS} fps)", flush=True)
     return camera
 
 
@@ -571,10 +681,10 @@ def detect_cardboard(frames, announce=True):
 
     # Keep saturation above the near-grey background range. Two close value
     # ranges accommodate illumination changes without accepting almost every
-    # neutral surface in the image.
+    # neutral surface in the image. Table is dark grey (V <= 88); cardboard is tan (V >= 95).
     ranges = [
-        (np.array((3, 16, 40), np.uint8), np.array((48, 190, 245), np.uint8)),
-        (np.array((3, 20, 35), np.uint8), np.array((48, 220, 240), np.uint8)),
+        (np.array((4, 20, 95), np.uint8), np.array((45, 195, 245), np.uint8)),
+        (np.array((3, 22, 90), np.uint8), np.array((48, 210, 240), np.uint8)),
     ]
     candidates = []
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 25))
@@ -621,8 +731,6 @@ def detect_cardboard(frames, announce=True):
             # this camera view; the location prior is combined with geometry.
             if not (CARDBOARD_CENTER_X_RANGE[0] <= centre_x_fraction <= CARDBOARD_CENTER_X_RANGE[1]):
                 continue
-            if bx <= x1 + 2 or bx + bw >= x2 - 2:
-                continue
             # Perspective, holes and printed markings lower the solidity and
             # rectangle fill of the real cardboard. Keep these checks tolerant
             # but still require a long, narrow, roughly rectangular component.
@@ -630,10 +738,9 @@ def detect_cardboard(frames, announce=True):
                 continue
 
             vertex_score = 1.0 if vertices <= 6 else max(0.55, 1.0 - 0.06 * (vertices - 6))
-            aspect_score = 1.0 - abs(aspect - 0.38)
-            centre_score = 1.0 - abs(centre_x_fraction - 0.51) / 0.12
-            centre_score = max(0.05, centre_score)
-            score = area * solidity * rect_fill * vertex_score * aspect_score * centre_score
+            aspect_score = max(0.10, 1.0 - 2.5 * abs(aspect - 0.21))
+            edge_penalty = 0.50 if (bx - x1 < 2 or (x2 - (bx + bw)) < 2) else 1.0
+            score = area * solidity * rect_fill * vertex_score * aspect_score * edge_penalty
             full_mask = np.zeros((h, w), np.uint8)
             full_mask[y1:y2, x1:x2] = local_mask
             candidates.append((score, area, contour, full_mask, solidity,
@@ -1234,15 +1341,15 @@ def extract_bright_top_face(hsv, raw_mask, contour):
     raw_roi = raw_mask[y:y + h, x:x + w]
     valid = (filled > 0) & (raw_roi > 0)
     values = hsv[y:y + h, x:x + w, 2][valid]
-    if values.size < 100:
+    if values.size < 60:
         return None
     p10, p90 = np.percentile(values, [10, 90])
-    if p90 - p10 < 16:
+    if p90 - p10 < 8:
         return None
     otsu, _ = cv2.threshold(values.reshape(-1, 1), 0, 255,
                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     # Keep Otsu from selecting only isolated specular highlights.
-    otsu = max(float(otsu), float(np.percentile(values, 42)))
+    otsu = max(float(otsu), float(np.percentile(values, 35)))
     v_roi = hsv[y:y + h, x:x + w, 2]
     bright = np.zeros((h, w), np.uint8)
     bright[valid & (v_roi > otsu)] = 255
@@ -1257,9 +1364,9 @@ def extract_bright_top_face(hsv, raw_mask, contour):
         bx, by, bw, bh = cv2.boundingRect(candidate)
         # A top face must touch/approach the top of the full object, not a
         # bright patch halfway down its side wall.
-        if by > max(3, int(0.18 * h)):
+        if by > max(4, int(0.28 * h)):
             continue
-        if a < max(90.0, 0.14 * full_area) or a > 0.95 * full_area:
+        if a < max(60.0, 0.12 * full_area) or a > 0.95 * full_area:
             continue
         shifted = candidate.copy()
         shifted[:, 0, 0] += x
@@ -1363,6 +1470,49 @@ def analyse_top_face(name, hsv, raw_mask, contour, full_metrics, full_fits):
                 "score": residual, "mode": "upper-arc ellipse",
                 "note": f"top ellipse AR={aspect:.2f} residual={residual:.3f}",
             }
+
+    # 3D prism geometric isolation for square, hexagon, and triangle:
+    # When brightness separation does not produce a distinct top face,
+    # perspective projection causes the silhouette to include the side wall(s)
+    # extending downwards/towards the table contact. Slicing the upper portion
+    # of the contour away from the side wall recovers the exact top face polygon.
+    if expected in ("square", "hexagon", "triangle"):
+        pts = np.asarray(contour, dtype=np.int32).reshape(-1, 2)
+        if len(pts) >= 12 and w >= 10 and h >= 10:
+            cap_h = float(w) * 0.866 if expected == "triangle" else float(min(w, h))
+            prism_candidates = []
+            for frac in (0.75, 0.82, 0.88, 0.94, 1.00, 1.06, 1.12, 1.18, 1.25):
+                cutoff = y + frac * cap_h
+                upper = pts[pts[:, 1] <= cutoff]
+                if len(upper) < 6:
+                    continue
+                uhull = cv2.convexHull(upper)
+                poly, poly_score = fit_top_face_polygon(uhull, expected)
+                if poly is not None:
+                    m_hull = cv2.moments(uhull)
+                    if m_hull["m00"] > 0:
+                        cx = float(m_hull["m10"] / m_hull["m00"])
+                        cy = float(m_hull["m01"] / m_hull["m00"])
+                        expected_cy = y + (0.50 if expected != "triangle" else 0.58) * cap_h
+                        cy_penalty = 0.15 * (abs(cy - expected_cy) / max(cap_h, 1.0))
+                        prism_candidates.append((poly_score + cy_penalty, poly_score, uhull, (cx, cy), float(cv2.contourArea(uhull)), poly))
+            if prism_candidates:
+                prism_candidates.sort(key=lambda item: item[0])
+                _, best_score, best_hull, best_center, best_area, best_poly = prism_candidates[0]
+                m_top = contour_metrics(best_hull)
+                if m_top is not None:
+                    m_top["polygon_" + expected] = best_poly
+                return {
+                    "center": best_center,
+                    "area": best_area,
+                    "contour": best_hull,
+                    "ellipse": None,
+                    "metrics": m_top if m_top is not None else full_metrics,
+                    "score": float(best_score),
+                    "mode": f"geometric top-cap {expected}",
+                    "note": f"top cap isolated from 3D side wall (score={best_score:.3f})",
+                }
+
     # Green-circle fallback: accept a coherent elliptical/circular silhouette
     # even when the full 3-D side-wall contour is less circular than its top.
     # When the silhouette is taller than wide (includes cylinder side wall),
@@ -2047,8 +2197,16 @@ def new_sample_store():
 
 
 def main():
+    global HEADLESS
     print("Starting 5-second shape sorting vision...", flush=True)
     print("Rule: all four cardboard holes are mandatory; coloured blocks are optional (0-4).", flush=True)
+    if not HEADLESS:
+        try:
+            cv2.namedWindow("__probe__", cv2.WINDOW_AUTOSIZE)
+            cv2.destroyWindow("__probe__")
+        except cv2.error as exc:
+            print(f"[WARN] X11/GTK display unavailable ({exc}). Running in headless mode automatically.", flush=True)
+            HEADLESS = True
     print(f"DISPLAY={os.environ.get('DISPLAY', '<not set>')}  headless={HEADLESS}", flush=True)
     run_dir = make_run_dir()
     paths = (
@@ -2086,11 +2244,14 @@ def main():
         "place pixels use the 8-corner dual-ArUco homography (with persistent fallback).",
         flush=True,
     )
-    print(
-        f"Placing coordinate offset applied: dX={PLACE_OFFSET_X_M * 1000:+.1f} mm ({PLACE_OFFSET_X_M * 100:+.1f} cm), "
-        f"dY={PLACE_OFFSET_Y_M * 1000:+.1f} mm",
-        flush=True,
-    )
+    print("Picking coordinate offsets applied (robot XY metres):", flush=True)
+    for s_name in SHAPE_ORDER:
+        s_off = PER_SHAPE_PICK_OFFSETS.get(s_name, np.array([PICK_OFFSET_X_M, PICK_OFFSET_Y_M], dtype=np.float64))
+        print(f"  {s_name:16s}: dX={s_off[0]*1000:+.1f} mm, dY={s_off[1]*1000:+.1f} mm", flush=True)
+    print("Placing coordinate offsets applied (robot XY metres):", flush=True)
+    for s_name in SHAPE_ORDER:
+        s_off = PER_SHAPE_PLACE_OFFSETS.get(s_name, np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64))
+        print(f"  {s_name:16s}: dX={s_off[0]*1000:+.1f} mm, dY={s_off[1]*1000:+.1f} mm", flush=True)
     camera = open_camera()
     try:
         ok, first_frame = camera.read()
@@ -2175,8 +2336,8 @@ def main():
                     board_misses = 0
                 else:
                     board_misses += 1
-                    if board_misses >= BOARD_MAX_MISSES:
-                        strip = None
+                    # Retain the last known valid cardboard strip. Never discard
+                    # the stationary board during the averaging window.
 
             objects, object_mask, object_debug, raw_masks = find_coloured_objects(
                 frame, roi, None if strip is None else strip["mask"])
@@ -2350,25 +2511,32 @@ def main():
                     (0, 255, 255), 1, cv2.LINE_AA
                 )
 
-            cv2.imshow(WINDOW_NAME, display)
-            if show_masks:
-                cv2.imshow(MASK_WINDOW_NAME, raw_masks)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("m"), ord("M")):
-                show_masks = not show_masks
-                if not show_masks:
-                    cv2.destroyWindow(MASK_WINDOW_NAME)
-            if key in (ord("x"), ord("X")):
-                aborted = True
-                print("Vision cancelled by user.", flush=True)
-                break
-            if key in (ord("q"), ord("Q"), 27):
-                if averaging_done:
-                    print("Preview accepted; continuing to target validation.", flush=True)
-                else:
+            try:
+                cv2.imshow(WINDOW_NAME, display)
+                if show_masks:
+                    cv2.imshow(MASK_WINDOW_NAME, raw_masks)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("m"), ord("M")):
+                    show_masks = not show_masks
+                    if not show_masks:
+                        cv2.destroyWindow(MASK_WINDOW_NAME)
+                if key in (ord("x"), ord("X")):
                     aborted = True
-                    print("Vision cancelled before averaging completed.", flush=True)
-                break
+                    print("Vision cancelled by user.", flush=True)
+                    break
+                if key in (ord("q"), ord("Q"), 27):
+                    if averaging_done:
+                        print("Preview accepted; continuing to target validation.", flush=True)
+                    else:
+                        aborted = True
+                        print("Vision cancelled before averaging completed.", flush=True)
+                    break
+            except cv2.error as exc:
+                print(f"[WARN] GUI display error ({exc}). Switching to headless mode.", flush=True)
+                HEADLESS = True
+                if averaging_done:
+                    print("Averaging completed; accepting target coordinates automatically.", flush=True)
+                    break
 
         _close_windows()
         if aborted or not averaging_done:

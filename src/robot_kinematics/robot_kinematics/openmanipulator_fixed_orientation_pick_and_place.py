@@ -62,7 +62,7 @@ TASK_TOOL_ANGLE = float(np.deg2rad(45.0))
 # TCP position recorded for POSE SAMPLE 17 (metres).
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
-PICK_CONTACT_Z = float(os.environ.get("PICK_CONTACT_Z", "0.090"))   # Lowest pick contact height (m)
+PICK_CONTACT_Z = float(os.environ.get("PICK_CONTACT_Z", "0.060"))   # Lowest pick contact height (0.060 m = 6 cm)
 
 # Hard safety floor: arm/TCP must NEVER descend below 0.078 m (78 mm) for any shape at any point.
 MIN_PLACE_Z = float(os.environ.get("MIN_PLACE_Z", "0.078"))         # Hard minimum placing floor (0.078 m)
@@ -127,39 +127,68 @@ SORT_SHAPES = (
     "yellow_triangle",
 )
 
-# Revolute-to-prismatic mapping configured in ros2_control xacro:
-#   revolute_min = 0.92 rad  -> prismatic_min = -0.010 m
-#   revolute_max = -1.52 rad -> prismatic_max = +0.019 m
-# prismatic = slope * revolute + intercept
-REVOLUTE_TO_PRISMATIC_SLOPE = (0.019 - (-0.010)) / (-1.52 - 0.92)  # -0.011885246 m/rad
-REVOLUTE_TO_PRISMATIC_INTERCEPT = -0.010 - REVOLUTE_TO_PRISMATIC_SLOPE * 0.92  # 0.000934426 m
+# Gripper physical calibration from DYNAMIXEL Wizard 2.0 (in degrees):
+#   Open / Home state: 145.5 deg (maps to -0.010 m prismatic)
+#   Closed reference:  210.0 deg (maps to +0.019 m prismatic)
+# Per-shape measured grip angles:
+#   green_circle:     182.0 deg
+#   blue_square:      184.6 deg
+#   orange_hexagon:   193.0 deg
+#   yellow_triangle:  203.8 deg
+GRIPPER_HOME_ANGLE_DEG = float(os.environ.get("GRIPPER_HOME_ANGLE_DEG", os.environ.get("GRIPPER_OPEN_DEG", "145.5")))
+GRIPPER_OPEN_ANGLE_DEG = GRIPPER_HOME_ANGLE_DEG
+GRIPPER_CLOSED_MAX_DEG = float(os.environ.get("GRIPPER_MAX_CLOSE_DEG", "210.0"))
 
-def dxl5_to_prismatic(dxl5_rad: float) -> float:
-    """Convert dxl5 raw motor radians to GripperCommand prismatic position (metres)."""
-    return float(REVOLUTE_TO_PRISMATIC_SLOPE * float(dxl5_rad) + REVOLUTE_TO_PRISMATIC_INTERCEPT)
-
-# Raw dxl5 motor interface units (rad) calibrated on physical hardware:
-#   Open gripper (default): -0.93 rad -> +0.01199 m
-#   Grip position for all shapes: +0.46 rad -> -0.00453 m
-DXL5_OPEN_POSITION_RAD = -0.93
-DXL5_COMMON_GRIP_RAD = 0.46
-DXL5_GRIP_POSITIONS_RAD = {
-    "blue_square": DXL5_COMMON_GRIP_RAD,
-    "green_circle": DXL5_COMMON_GRIP_RAD,
-    "orange_hexagon": DXL5_COMMON_GRIP_RAD,
-    "yellow_triangle": DXL5_COMMON_GRIP_RAD,
+SHAPE_GRIP_ANGLES_DEG = {
+    "green_circle":    float(os.environ.get("GRIP_DEG_GREEN_CIRCLE", "182.0")),
+    "blue_square":     float(os.environ.get("GRIP_DEG_BLUE_SQUARE", "184.6")),
+    "orange_hexagon":  float(os.environ.get("GRIP_DEG_ORANGE_HEXAGON", "193.0")),
+    "yellow_triangle": float(os.environ.get("GRIP_DEG_YELLOW_TRIANGLE", "203.8")),
 }
 
-GRIPPER_OPEN_POSITION = dxl5_to_prismatic(DXL5_OPEN_POSITION_RAD)
-GRIPPER_MAX_SEPARATION_POSITION = GRIPPER_OPEN_POSITION
-GRIPPER_CLOSED_POSITION = -0.00944
-GRIPPER_DEFAULT_GRIP_POSITION = dxl5_to_prismatic(DXL5_COMMON_GRIP_RAD)
+def angle_deg_to_prismatic(deg: float) -> float:
+    """
+    Map physical motor degrees [145.5, 210.0] linearly to ROS 2 prismatic meters [-0.010, 0.019].
+    With xacro revolute_min = -0.6021 rad (145.5 deg) and revolute_max = 0.5236 rad (210.0 deg),
+    this produces the exact commanded motor angle in hardware.
+    """
+    fraction = (deg - GRIPPER_HOME_ANGLE_DEG) / (GRIPPER_CLOSED_MAX_DEG - GRIPPER_HOME_ANGLE_DEG)
+    return float(-0.010 + fraction * (0.019 - (-0.010)))
+
+def prismatic_to_angle_deg(pris: float) -> float:
+    """Map ROS 2 prismatic meters [-0.010, 0.019] linearly to physical motor degrees [145.5, 210.0]."""
+    fraction = (pris - (-0.010)) / (0.019 - (-0.010))
+    return float(GRIPPER_HOME_ANGLE_DEG + fraction * (GRIPPER_CLOSED_MAX_DEG - GRIPPER_HOME_ANGLE_DEG))
+
+def parse_gripper_target(val) -> tuple:
+    """Parse gripper target returning (deg, prismatic_m)."""
+    v = float(val)
+    if abs(v) > 1.0:
+        deg = v
+        pris = angle_deg_to_prismatic(deg)
+    else:
+        pris = v
+        deg = prismatic_to_angle_deg(pris)
+    return deg, pris
+
+GRIPPER_HOME_POSITION = angle_deg_to_prismatic(GRIPPER_HOME_ANGLE_DEG)  # -0.010 m (145.5 deg)
+GRIPPER_OPEN_POSITION = GRIPPER_HOME_POSITION
+GRIPPER_MAX_SEPARATION_POSITION = GRIPPER_HOME_POSITION
+GRIPPER_CLOSED_POSITION = angle_deg_to_prismatic(203.8)
+GRIPPER_DEFAULT_GRIP_POSITION = GRIPPER_CLOSED_POSITION
 GRIPPER_MAX_EFFORT = 20.0
 
-# Per-shape grip positions (in metres, sent to GripperCommand position).
+def dxl5_to_prismatic(dxl5_rad: float) -> float:
+    """Pass-through/helper for compatibility."""
+    return float(dxl5_rad)
+
+def prismatic_to_dxl5(prismatic_m: float) -> float:
+    """Pass-through/helper for compatibility."""
+    return float(prismatic_m)
+
 GRIP_POSITIONS_BY_SHAPE = {
-    shape: dxl5_to_prismatic(rad)
-    for shape, rad in DXL5_GRIP_POSITIONS_RAD.items()
+    shape: angle_deg_to_prismatic(deg)
+    for shape, deg in SHAPE_GRIP_ANGLES_DEG.items()
 }
 
 # Live execution on hardware (DRY_RUN disabled)
@@ -759,7 +788,7 @@ class PickPlaceNode(Node):
         self.dxl_data_client = self.create_client(SetDataToDxl, "/dynamixel_hardware_interface/set_dxl_data")
 
     def enable_torque(self):
-        # 1. Ensure master torque is enabled
+        # 1. Ensure master torque is enabled via service
         if self.torque_client.wait_for_service(timeout_sec=3.0):
             req = SetBool.Request(data=True)
             future = self.torque_client.call_async(req)
@@ -769,18 +798,32 @@ class PickPlaceNode(Node):
         else:
             print("[WARN] Torque service not available, continuing...")
 
-        # 2. Specifically ensure gripper motor (dxl5 / ID 15) has Torque Enable = 1
+        # 2. Specifically ensure arm Dynamixels (dxl1-dxl4: IDs 11-14) have Torque Enable = 1
         if self.dxl_data_client.wait_for_service(timeout_sec=3.0):
+            for dxl_id in (11, 12, 13, 14):
+                req = SetDataToDxl.Request()
+                req.id = int(dxl_id)
+                req.item_name = "Torque Enable"
+                req.item_data = 1
+                future = self.dxl_data_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+                if future.done() and future.result() is not None and future.result().result:
+                    print(f"[INFO] Dynamixel ID {dxl_id} torque explicitly enabled.")
+                else:
+                    print(f"[WARN] Failed to explicitly enable Dynamixel ID {dxl_id} torque.")
+
+            # Gripper motor (ID 15): enable torque for pick-and-place operations (set ENABLE_GRIPPER_TORQUE=0 to disable)
+            grip_torque_val = 0 if os.environ.get("ENABLE_GRIPPER_TORQUE", "1") == "0" else 1
             req = SetDataToDxl.Request()
             req.id = 15
             req.item_name = "Torque Enable"
-            req.item_data = 1
+            req.item_data = grip_torque_val
             future = self.dxl_data_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-            if future.done() and future.result() is not None and future.result().result:
-                print("[INFO] Gripper Dynamixel (ID 15) torque explicitly enabled.")
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            if grip_torque_val == 0:
+                print("[INFO] Gripper Dynamixel (ID 15) torque explicitly DISABLED.")
             else:
-                print("[WARN] Failed to explicitly enable gripper Dynamixel ID 15 torque.")
+                print("[INFO] Gripper Dynamixel (ID 15) torque explicitly ENABLED.")
 
     def joint_callback(self, msg):
         if len(msg.name) != len(msg.position):
@@ -845,15 +888,22 @@ class PickPlaceNode(Node):
         print(f"Completed: {label}")
 
     def command_gripper(self, position, label):
+        deg_val, pris_val = parse_gripper_target(position)
         if DRY_RUN:
-            print(f"[DRY RUN] Would command gripper {label}: {position:.4f} m")
+            print(f"[DRY RUN] Would command gripper {label}: {deg_val:.1f}° (prismatic: {pris_val:.4f} m)")
             return
+
+        if os.environ.get("ENABLE_GRIPPER_TORQUE", "1") == "0":
+            print(f"[INFO] Gripper torque disabled: skipping gripper move for {label}")
+            return
+
+        print(f"[GRIPPER] Commanding {label}: {deg_val:.1f}° (prismatic: {pris_val:.4f} m)")
 
         if not self.gripper_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(f"Gripper action server unavailable: {GRIPPER_ACTION}")
 
         goal = GripperCommand.Goal()
-        goal.command.position = float(position)
+        goal.command.position = float(pris_val)
         goal.command.max_effort = float(GRIPPER_MAX_EFFORT)
         send_future = self.gripper_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_future)
@@ -872,7 +922,22 @@ class PickPlaceNode(Node):
                 f"stalled={wrapped_result.result.stalled}, "
                 f"position={wrapped_result.result.position:.4f}"
             )
-        print(f"Gripper completed: {label} (position={wrapped_result.result.position:.4f} m)")
+        res_deg, _ = parse_gripper_target(wrapped_result.result.position)
+        print(f"Gripper completed: {label} (actual: {res_deg:.1f}°, {wrapped_result.result.position:.4f} m)")
+
+    def destroy_node(self):
+        # Guarantee gripper torque is unpowered upon sequence completion or exit
+        if hasattr(self, 'dxl_data_client') and self.dxl_data_client.wait_for_service(timeout_sec=1.0):
+            try:
+                req = SetDataToDxl.Request()
+                req.id = 15
+                req.item_name = "Torque Enable"
+                req.item_data = 0
+                future = self.dxl_data_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
+            except Exception:
+                pass
+        super().destroy_node()
 
 
 # -----------------------------------------------------------------------------
@@ -910,7 +975,14 @@ def load_sort_targets():
         if np.linalg.norm(targets[index, 0] - targets[index, 1]) < 0.005:
             raise ValueError(f"{name}: pick and place coordinates are less than 5 mm apart.")
 
-    # Optional controller-level offset override (if running controller standalone without re-running vision)
+    # Optional controller-level offset overrides (if running controller standalone without re-running vision)
+    ctrl_pick_dx = float(os.environ.get("CONTROLLER_PICK_OFFSET_X", "0.000"))
+    ctrl_pick_dy = float(os.environ.get("CONTROLLER_PICK_OFFSET_Y", "0.000"))
+    if ctrl_pick_dx != 0.0 or ctrl_pick_dy != 0.0:
+        targets[:, 0, 0] += ctrl_pick_dx
+        targets[:, 0, 1] += ctrl_pick_dy
+        print(f"[OFFSET] Applied runtime pick offset: dX={ctrl_pick_dx * 1000:+.1f} mm, dY={ctrl_pick_dy * 1000:+.1f} mm", flush=True)
+
     ctrl_dx = float(os.environ.get("CONTROLLER_PLACE_OFFSET_X", "0.000"))
     ctrl_dy = float(os.environ.get("CONTROLLER_PLACE_OFFSET_Y", "0.000"))
     if ctrl_dx != 0.0 or ctrl_dy != 0.0:
@@ -1162,8 +1234,8 @@ def run_sequence(node):
         if np.linalg.norm(work_xyz - HOME_XYZ) > MAX_SEGMENT_START_ERROR:
             raise RuntimeError("Working-home TCP drifted beyond the allowed tolerance.")
 
-    # Open gripper to default position before beginning picking cycles
-    node.command_gripper(GRIPPER_OPEN_POSITION, "initial open to default position")
+    # Open gripper to primary home position (145.5 deg) before beginning picking cycles
+    node.command_gripper(GRIPPER_HOME_POSITION, f"initial open to home position ({GRIPPER_HOME_ANGLE_DEG:.1f}°)")
 
     for index, name in enumerate(labels):
         pick_xy = targets[index, 0]
@@ -1195,8 +1267,8 @@ def run_sequence(node):
             goal_tool_angle=pick_above_pitch,
         )
         node.command_gripper(
-            GRIPPER_MAX_SEPARATION_POSITION,
-            f"open before picking {name}",
+            GRIPPER_HOME_POSITION,
+            f"open to home before picking {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
         )
 
         # Phase 1/4: descend to pick
@@ -1207,8 +1279,10 @@ def run_sequence(node):
             start_tool_angle=pick_above_pitch,
             goal_tool_angle=pick_contact_pitch,
         )
-        grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_DEFAULT_GRIP_POSITION)
-        node.command_gripper(grip_pos, f"grip {name} ({grip_pos:.4f} m)")
+        grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_CLOSED_POSITION)
+        grip_deg = SHAPE_GRIP_ANGLES_DEG.get(name, 203.8)
+        node.command_gripper(grip_pos, f"grip {name} ({grip_deg:.1f}° / {grip_pos:.4f} m)")
+        time.sleep(0.5)
 
         # Phase 2/4: lift to clearance
         current_q = plan_and_execute_to(
@@ -1239,8 +1313,8 @@ def run_sequence(node):
             goal_tool_angle=place_contact_pitch,
         )
         node.command_gripper(
-            GRIPPER_MAX_SEPARATION_POSITION,
-            f"open after placing {name}",
+            GRIPPER_HOME_POSITION,
+            f"open to home after placing {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
         )
 
         # Retract after placement
@@ -1271,6 +1345,7 @@ def run_sequence(node):
 
     final_times, final_path = plan_startup_joint_move(current_q, HOME_Q)
     node.execute_arm(final_path, final_times, "final move to exact TARGET_Q home pose")
+    node.command_gripper(GRIPPER_HOME_POSITION, f"final home gripper ({GRIPPER_HOME_ANGLE_DEG:.1f}°)")
 
     if not DRY_RUN:
         final_q = validate_q(node.get_current_q(), "Measured final joints")
