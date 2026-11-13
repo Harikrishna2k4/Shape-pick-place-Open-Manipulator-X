@@ -96,11 +96,14 @@ GRIPPER_ACTION = "/gripper_controller/gripper_cmd"
 TORQUE_SERVICE = "/dynamixel_hardware_interface/set_dxl_torque"
 DXL_DATA_SERVICE = "/dynamixel_hardware_interface/set_dxl_data"
 
-# Motion limits and parameters
+# Motion limits and parameters (configured for gentle, smooth, and safe motion)
 FREQUENCY_HZ = 50.0
-MIN_DURATION = 4.0
-MAX_JOINT_VELOCITY = np.array([0.5, 0.5, 0.5, 0.5], dtype=float)       # rad/s
-MAX_JOINT_ACCELERATION = np.array([0.8, 0.8, 0.8, 0.8], dtype=float)  # rad/s^2
+DEFAULT_MIN_DURATION = float(os.environ.get("GOTO_DURATION", "8.0"))
+DEFAULT_MAX_VELOCITY = float(os.environ.get("GOTO_MAX_VEL", "0.20"))       # rad/s (~11.5 deg/s)
+DEFAULT_MAX_ACCEL = float(os.environ.get("GOTO_MAX_ACCEL", "0.30"))       # rad/s^2 (~17.2 deg/s^2)
+
+MAX_JOINT_VELOCITY = np.array([DEFAULT_MAX_VELOCITY] * 4, dtype=float)
+MAX_JOINT_ACCELERATION = np.array([DEFAULT_MAX_ACCEL] * 4, dtype=float)
 
 
 def make_duration(seconds: float) -> Duration:
@@ -112,12 +115,13 @@ def make_duration(seconds: float) -> Duration:
     return Duration(sec=sec, nanosec=nanosec)
 
 
-def compute_trajectory(q_start: np.ndarray, q_goal: np.ndarray):
+def compute_trajectory(q_start: np.ndarray, q_goal: np.ndarray, min_duration: float = None):
     """Generate a smooth quintic joint-space trajectory with zero start and end velocity/acceleration."""
+    min_d = DEFAULT_MIN_DURATION if min_duration is None else float(min_duration)
     delta = np.asarray(q_goal, dtype=float) - np.asarray(q_start, dtype=float)
     t_v = float(np.max(1.875 * np.abs(delta) / MAX_JOINT_VELOCITY))
     t_a = float(np.max(np.sqrt((10.0 / np.sqrt(3.0)) * np.abs(delta) / MAX_JOINT_ACCELERATION)))
-    duration = max(MIN_DURATION, t_v, t_a)
+    duration = max(min_d, t_v, t_a)
 
     sample_count = max(3, int(np.ceil(duration * FREQUENCY_HZ)) + 1)
     times = np.linspace(0.0, duration, sample_count)
@@ -222,6 +226,17 @@ class GotoHomeNode(Node):
             future = self.dxl_data_client.call_async(req)
             rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
             self.get_logger().info("Gripper Dynamixel (ID 15) torque explicitly disabled.")
+        elif enable_grip and self.dxl_data_client is not None and self.dxl_data_client.wait_for_service(timeout_sec=2.0):
+            # Ensure gripper motor ID 15 uses a gentle profile velocity to prevent snapping
+            try:
+                req_vel = SetDataToDxl.Request()
+                req_vel.id = 15
+                req_vel.item_name = "Profile Velocity"
+                req_vel.item_data = int(os.environ.get("GRIPPER_PROFILE_VEL", "80"))
+                f_vel = self.dxl_data_client.call_async(req_vel)
+                rclpy.spin_until_future_complete(self, f_vel, timeout_sec=1.0)
+            except Exception:
+                pass
 
     def get_current_joints(self, timeout_sec: float = 10.0) -> np.ndarray:
         """Wait for and return fresh measured joint angles from /joint_states."""
@@ -319,11 +334,41 @@ class GotoHomeNode(Node):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="OpenMANIPULATOR-X: Move gently to Home pose.")
+    parser.add_argument("--duration", type=float, default=None, help="Target trajectory duration in seconds (default: 8.0-12.0s)")
+    parser.add_argument("--speed", choices=["slow", "gentle", "normal", "fast"], default=None, help="Speed preset")
+    args, _ = parser.parse_known_args()
+
+    global MAX_JOINT_VELOCITY, MAX_JOINT_ACCELERATION
+    min_d = args.duration
+    if args.speed == "slow":
+        MAX_JOINT_VELOCITY = np.array([0.12] * 4, dtype=float)
+        MAX_JOINT_ACCELERATION = np.array([0.20] * 4, dtype=float)
+        if min_d is None:
+            min_d = 12.0
+    elif args.speed == "gentle" or args.speed is None:
+        MAX_JOINT_VELOCITY = np.array([0.20] * 4, dtype=float)
+        MAX_JOINT_ACCELERATION = np.array([0.30] * 4, dtype=float)
+        if min_d is None:
+            min_d = DEFAULT_MIN_DURATION
+    elif args.speed == "normal":
+        MAX_JOINT_VELOCITY = np.array([0.35] * 4, dtype=float)
+        MAX_JOINT_ACCELERATION = np.array([0.50] * 4, dtype=float)
+        if min_d is None:
+            min_d = 5.0
+    elif args.speed == "fast":
+        MAX_JOINT_VELOCITY = np.array([0.50] * 4, dtype=float)
+        MAX_JOINT_ACCELERATION = np.array([0.80] * 4, dtype=float)
+        if min_d is None:
+            min_d = 4.0
+
     print("=" * 60)
-    print("OpenMANIPULATOR-X: Goto Home")
+    print("OpenMANIPULATOR-X: Goto Home (Gentle Motion)")
     print(f"Target HOME_XYZ:        {HOME_XYZ} m")
     print(f"Target Joints:          {np.round(TARGET_Q, 5)} rad")
     print(f"Target Gripper:         {TARGET_GRIPPER_DEG:.1f}° ({TARGET_GRIPPER_POSITION:+.5f} m, home)")
+    print(f"Speed Limit:            {np.rad2deg(MAX_JOINT_VELOCITY[0]):.1f}°/s ({MAX_JOINT_VELOCITY[0]:.2f} rad/s)")
     print("=" * 60)
 
     rclpy.init()
@@ -347,9 +392,9 @@ def main():
 
         # 3. Plan smooth quintic trajectory
         duration, times, positions, velocities, accelerations = compute_trajectory(
-            current_q, TARGET_Q
+            current_q, TARGET_Q, min_duration=min_d
         )
-        print(f"Planned smooth trajectory: {duration:.2f}s ({len(times)} points)")
+        print(f"Planned smooth trajectory: {duration:.2f}s ({len(times)} points, max velocity: {np.rad2deg(MAX_JOINT_VELOCITY[0]):.1f}°/s)")
 
         # 4. Execute trajectory immediately
         node.execute_trajectory(times, positions, velocities, accelerations)

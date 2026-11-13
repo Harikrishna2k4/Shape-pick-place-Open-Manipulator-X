@@ -196,11 +196,11 @@ DRY_RUN = False
 REQUIRE_EXECUTE_CONFIRMATION = False
 
 FREQUENCY_HZ = 50.0
-HOME_DURATION = 5.0
-CARTESIAN_DURATION = 3.0
-VERTICAL_DURATION = 3.0
-MAX_JOINT_VELOCITY = np.array([1.5, 1.5, 1.5, 1.5], dtype=float)
-MAX_JOINT_ACCELERATION = np.array([3.0, 3.0, 3.0, 3.0], dtype=float)
+HOME_DURATION = float(os.environ.get("HOME_DURATION", "8.0"))
+CARTESIAN_DURATION = float(os.environ.get("CARTESIAN_DURATION", "4.0"))
+VERTICAL_DURATION = float(os.environ.get("VERTICAL_DURATION", "4.0"))
+MAX_JOINT_VELOCITY = np.array([float(os.environ.get("MAX_JOINT_VEL", "0.5"))] * 4, dtype=float)
+MAX_JOINT_ACCELERATION = np.array([float(os.environ.get("MAX_JOINT_ACCEL", "1.0"))] * 4, dtype=float)
 
 JOINT_STATE_TIMEOUT = 10.0
 JOINT_STATE_MAX_AGE = 0.5
