@@ -106,9 +106,9 @@ MAIN_UNIQUE_WAYPOINT_COUNT = (
 MAX_MAIN_UNIQUE_WAYPOINTS = 15
 
 # Approach/retract/return paths are separate from the 15-point four-phase path.
-APPROACH_WAYPOINTS = 5
+APPROACH_WAYPOINTS = 9
 POST_PLACE_RETRACT_WAYPOINTS = 5
-RETURN_HOME_WAYPOINTS = 7
+RETURN_HOME_WAYPOINTS = 9
 
 MAX_HORIZONTAL_Z_DEVIATION = 0.015  # 15 mm maximum height drift during XY transfer.
 MAX_VERTICAL_XY_DRIFT = 0.015       # 15 mm maximum lateral drift during vertical moves.
@@ -996,6 +996,13 @@ def load_sort_targets():
             if sname in ("green_circle", "orange_hexagon"):
                 targets[idx, 1, 1] += bottom_dy
                 print(f"[OFFSET] Applied runtime place offset to {sname}: dY={bottom_dy * 1000:+.1f} mm", flush=True)
+
+    ctrl_circle_dy = float(os.environ.get("CONTROLLER_CIRCLE_PLACE_OFFSET_Y", "0.000"))
+    if ctrl_circle_dy != 0.0:
+        for idx, sname in enumerate(labels):
+            if sname == "green_circle":
+                targets[idx, 1, 1] += ctrl_circle_dy
+                print(f"[OFFSET] Applied runtime circle place offset: dY={ctrl_circle_dy * 1000:+.1f} mm", flush=True)
 
     return targets, labels
 

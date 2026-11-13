@@ -146,20 +146,37 @@ DEFAULT_REFERENCE_IMAGE_CORNERS_BY_ID = {
 }
 
 # 3D object height parallax compensation:
-# When objects are far from the assumed camera nadir (especially near the robot base),
-# applying full parallax displacement factors (0.12 - 0.22) artificially shifts the
-# pick target by ~18 to 20 mm in X and up to ~29 mm laterally in Y, which produces
-# the observed ~2 cm offset when picking shapes near the base.
+# Ground truth physical calibration:
+#   Camera height from base:   50.0 cm (0.500 m)
+#   Object top plane height:    9.5 cm (0.095 m)
+#   Theoretical factor:         9.5 / 50.0 = 0.190 (19.0% displacement towards nadir)
 #
-# Defaults to 0.0 (disabled, pure homography mapping). Set SHAPE_SORT_PARALLAX_SCALE
-# to a non-zero value if slight partial correction is ever needed.
-PARALLAX_SCALE = float(os.environ.get("SHAPE_SORT_PARALLAX_SCALE", "0.0"))
-CAMERA_NADIR_PX = np.array([383.0, 290.5], dtype=np.float64)
+# Perspective geometry:
+# The overhead camera views the elevated top plane of the 9.5 cm blocks obliquely.
+# The table ArUco homography maps points on the Z=0 table plane. Because the camera
+# ray passes through the elevated block top before striking Z=0, the detected top
+# contour appears displaced radially away from the camera nadir.
+# Scaling each block's top-face pixel towards the camera nadir by H_obj / H_cam (0.190)
+# projects the point vertically down to its true ground footprint centre.
+CAMERA_HEIGHT_M = float(os.environ.get("CAMERA_HEIGHT_M", "0.500"))
+OBJECT_TOP_HEIGHT_M = float(os.environ.get("OBJECT_TOP_HEIGHT_M", "0.095"))
+PARALLAX_RATIO = float(OBJECT_TOP_HEIGHT_M / CAMERA_HEIGHT_M)  # 0.190
+
+# Master parallax scale (1.0 = fully enabled; set 0.0 only to disable)
+PARALLAX_SCALE = float(os.environ.get("SHAPE_SORT_PARALLAX_SCALE", "1.0"))
+EFFECTIVE_PARALLAX = PARALLAX_RATIO * PARALLAX_SCALE
+
+CAMERA_NADIR_PX = np.array([
+    float(os.environ.get("CAMERA_NADIR_PX_X", "383.0")),
+    float(os.environ.get("CAMERA_NADIR_PX_Y", "290.5")),
+], dtype=np.float64)
+
+# Equal isotropic 19.0% correction for all shapes sharing the 9.5 cm top plane
 OBJECT_PARALLAX_FACTORS = {
-    "green_circle":    np.array([0.155, 0.220], dtype=np.float64) * PARALLAX_SCALE,
-    "blue_square":     np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
-    "orange_hexagon":  np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
-    "yellow_triangle": np.array([0.120, 0.160], dtype=np.float64) * PARALLAX_SCALE,
+    "green_circle":    np.array([EFFECTIVE_PARALLAX, EFFECTIVE_PARALLAX], dtype=np.float64),
+    "blue_square":     np.array([EFFECTIVE_PARALLAX, EFFECTIVE_PARALLAX], dtype=np.float64),
+    "orange_hexagon":  np.array([EFFECTIVE_PARALLAX, EFFECTIVE_PARALLAX], dtype=np.float64),
+    "yellow_triangle": np.array([EFFECTIVE_PARALLAX, EFFECTIVE_PARALLAX], dtype=np.float64),
 }
 
 ARUCO_CORNER_LABELS = ("TL", "TR", "BR", "BL")
@@ -174,7 +191,7 @@ ARUCO_MAX_CORNER_JUMP_PX = 25.0
 # Negative Y shifts to the robot's right (upside in camera viewport).
 # Positive Y shifts to the robot's left (downside in camera viewport).
 #
-# All offsets removed (set to 0.0 m) by user request:
+# Default placing offset:
 PLACE_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_X", "0.000"))   #  0.0 cm
 PLACE_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PLACE_OFFSET_Y", "0.000"))   #  0.0 cm
 
@@ -182,12 +199,17 @@ BOTTOM_SHAPES_PLACE_OFFSET_Y_M = float(
     os.environ.get("SHAPE_SORT_BOTTOM_PLACE_OFFSET_Y", "0.000")
 )  # 0.0 cm
 
-PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.000"))     #  0.0 cm
+# Per-shape specific placing offsets:
+# Circle placing offset in cardboard (+3 cm Y offset):
+CIRCLE_PLACE_OFFSET_X_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_X", "0.000"))
+CIRCLE_PLACE_OFFSET_Y_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_Y", "0.030"))   # +3.0 cm (0.030 m)
+
+PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.010"))     #  +1.0 cm (farther from base)
 PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))     #  0.0 cm
 
 # Per-shape placing offsets [dX, dY] (metres):
 PER_SHAPE_PLACE_OFFSETS = {
-    "green_circle":    np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
+    "green_circle":    np.array([PLACE_OFFSET_X_M + CIRCLE_PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M + CIRCLE_PLACE_OFFSET_Y_M], dtype=np.float64),
     "orange_hexagon":  np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
     "blue_square":     np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
     "yellow_triangle": np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
@@ -913,7 +935,7 @@ def object_top_to_table_px(pixel_xy, shape_name=None):
     """Compensate for 3D object height parallax under oblique camera viewing."""
     p = np.asarray(pixel_xy, dtype=np.float64).reshape(2)
     factors = OBJECT_PARALLAX_FACTORS.get(
-        shape_name, np.array([0.120, 0.160], dtype=np.float64)
+        shape_name, np.array([EFFECTIVE_PARALLAX, EFFECTIVE_PARALLAX], dtype=np.float64)
     )
     return p + factors * (CAMERA_NADIR_PX - p)
 
@@ -2240,8 +2262,9 @@ def main():
             flush=True,
         )
     print(
-        "Object pick pixels (with 3D height parallax compensation) AND cardboard-hole "
-        "place pixels use the 8-corner dual-ArUco homography (with persistent fallback).",
+        f"Object pick pixels (with 3D height parallax compensation: H_cam={CAMERA_HEIGHT_M*100:.1f}cm, "
+        f"H_obj={OBJECT_TOP_HEIGHT_M*100:.1f}cm -> shift={EFFECTIVE_PARALLAX*100:.1f}% towards nadir {CAMERA_NADIR_PX}) "
+        "AND cardboard-hole place pixels use the 8-corner dual-ArUco homography (with persistent fallback).",
         flush=True,
     )
     print("Picking coordinate offsets applied (robot XY metres):", flush=True)
