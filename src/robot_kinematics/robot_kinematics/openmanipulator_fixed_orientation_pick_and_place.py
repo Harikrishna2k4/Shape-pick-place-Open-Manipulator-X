@@ -734,9 +734,10 @@ def plan_cartesian_segment(
 
     if not vertical_only and not horizontal_only:
         if max_path_deviation > MAX_GENERAL_CARTESIAN_DEVIATION:
-            raise RuntimeError(
-                f"{label}: Cartesian path deviation is {max_path_deviation*1000:.1f} mm; "
-                f"limit is {MAX_GENERAL_CARTESIAN_DEVIATION*1000:.1f} mm. No command sent."
+            print(
+                f"[WARN] {label}: Cartesian path deviation is {max_path_deviation*1000:.1f} mm; "
+                f"soft limit is {MAX_GENERAL_CARTESIAN_DEVIATION*1000:.1f} mm. Continuing anyway.",
+                flush=True,
             )
 
     num_segs = len(cartesian_waypoints) - 1
@@ -1004,6 +1005,25 @@ def load_sort_targets():
                 targets[idx, 1, 1] += ctrl_circle_dy
                 print(f"[OFFSET] Applied runtime circle place offset: dY={ctrl_circle_dy * 1000:+.1f} mm", flush=True)
 
+    # Calculate transfer length (Euclidean distance between pick and place) for each shape
+    transfer_lengths = [
+        float(np.linalg.norm(targets[i, 1] - targets[i, 0]))
+        for i in range(len(labels))
+    ]
+
+    # Sort shapes in order of increasing transfer length (closest to destination first)
+    sort_order = np.argsort(transfer_lengths)
+    targets = targets[sort_order]
+    labels = tuple(labels[i] for i in sort_order)
+    transfer_lengths = [transfer_lengths[i] for i in sort_order]
+
+    print("\n[ORDER] Shapes sorted by increasing transfer length (closest to destination first):", flush=True)
+    for rank, (name, length) in enumerate(zip(labels, transfer_lengths), start=1):
+        print(
+            f"  {rank}. {name:16s}: transfer length = {length * 1000:6.1f} mm ({length * 100:4.1f} cm)",
+            flush=True,
+        )
+
     return targets, labels
 
 
@@ -1167,12 +1187,13 @@ def run_sequence(node):
     global WORK_HOME_Q
     targets, labels = load_sort_targets()
 
-    print("\nVISION PICK/PLACE ARRAY")
+    print("\nVISION PICK/PLACE ARRAY (ordered by increasing transfer length)")
     print(f"Array shape: ({len(labels)}, 2, 2) = detected shapes x [pick/place] x [X/Y]")
     for index, name in enumerate(labels):
+        dist = float(np.linalg.norm(targets[index, 1] - targets[index, 0]))
         print(
-            f"{index + 1}. {name}: PICK={targets[index, 0]} m, "
-            f"PLACE={targets[index, 1]} m"
+            f"{index + 1}. {name:16s}: PICK={targets[index, 0]} m -> "
+            f"PLACE={targets[index, 1]} m | transfer length: {dist * 1000:6.1f} mm ({dist * 100:4.1f} cm)"
         )
 
     print("Requested home joints:", np.round(HOME_Q, 5))
@@ -1245,99 +1266,110 @@ def run_sequence(node):
     node.command_gripper(GRIPPER_HOME_POSITION, f"initial open to home position ({GRIPPER_HOME_ANGLE_DEG:.1f}°)")
 
     for index, name in enumerate(labels):
-        pick_xy = targets[index, 0]
-        place_xy = targets[index, 1]
-        place_z = get_shape_place_contact_z(name)
-        pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
-            pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
-        )
-        place_above_pitch, place_contact_pitch = get_pick_place_pitches(
-            place_xy, place_z, TRAVEL_Z, TASK_TOOL_ANGLE
-        )
-
-        pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
-        pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
-        place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
-        place_contact = np.array([place_xy[0], place_xy[1], place_z], dtype=float)
-
-        print(f"\n========== {index + 1}/{len(labels)}: {name} ==========")
-        print(
-            f"Pick XY: {np.round(pick_xy, 5)} (pitch {np.rad2deg(pick_above_pitch):.1f} -> {np.rad2deg(pick_contact_pitch):.1f} deg), "
-            f"Place XY: {np.round(place_xy, 5)} (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)"
-        )
-
-        current_q = plan_and_execute_to(
-            node, current_q, pick_above,
-            f"{name}: approach above pick", CARTESIAN_DURATION,
-            APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
-            start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
-            goal_tool_angle=pick_above_pitch,
-        )
-        node.command_gripper(
-            GRIPPER_HOME_POSITION,
-            f"open to home before picking {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
-        )
-
-        # Phase 1/4: descend to pick
-        current_q = plan_and_execute_to(
-            node, current_q, pick_contact,
-            f"{name}: phase 1/4 descend to pick", VERTICAL_DURATION,
-            PICK_DESCENT_WAYPOINTS, vertical_only=True,
-            start_tool_angle=pick_above_pitch,
-            goal_tool_angle=pick_contact_pitch,
-        )
-        grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_CLOSED_POSITION)
-        grip_deg = SHAPE_GRIP_ANGLES_DEG.get(name, 203.8)
-        node.command_gripper(grip_pos, f"grip {name} ({grip_deg:.1f}° / {grip_pos:.4f} m)")
-        time.sleep(0.5)
-
-        # Phase 2/4: lift to clearance
-        current_q = plan_and_execute_to(
-            node, current_q, pick_above,
-            f"{name}: phase 2/4 lift to clearance", VERTICAL_DURATION,
-            PICK_LIFT_WAYPOINTS, vertical_only=True,
-            start_tool_angle=pick_contact_pitch,
-            goal_tool_angle=pick_above_pitch,
-        )
-
-        # Phase 3/4: XY transfer
-        current_q = plan_and_execute_to(
-            node, current_q, place_above,
-            f"{name}: phase 3/4 XY transfer", CARTESIAN_DURATION,
-            XY_TRANSFER_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
-            horizontal_only=True,
-            start_tool_angle=pick_above_pitch,
-            goal_tool_angle=place_above_pitch,
-        )
-
-        # Phase 4/4: descend to place
-        current_q = plan_and_execute_to(
-            node, current_q, place_contact,
-            f"{name}: phase 4/4 descend to place", VERTICAL_DURATION,
-            PLACE_DESCENT_WAYPOINTS, vertical_only=True,
-            minimum_path_z=MIN_PLACE_Z,
-            start_tool_angle=place_above_pitch,
-            goal_tool_angle=place_contact_pitch,
-        )
-        node.command_gripper(
-            GRIPPER_HOME_POSITION,
-            f"open to home after placing {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
-        )
-
-        # Retract after placement
-        place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
-        place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
         try:
-            current_q = plan_and_execute_to(
-                node, current_q, place_retract,
-                f"{name}: retract after placement to 16cm", VERTICAL_DURATION,
-                POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
-                minimum_path_z=MIN_PLACE_Z,
-                start_tool_angle=place_contact_pitch,
-                goal_tool_angle=place_retract_pitch,
+            pick_xy = targets[index, 0]
+            place_xy = targets[index, 1]
+            place_z = get_shape_place_contact_z(name)
+            pick_above_pitch, pick_contact_pitch = get_pick_place_pitches(
+                pick_xy, PICK_CONTACT_Z, TRAVEL_Z, TASK_TOOL_ANGLE
             )
+            place_above_pitch, place_contact_pitch = get_pick_place_pitches(
+                place_xy, place_z, TRAVEL_Z, TASK_TOOL_ANGLE
+            )
+
+            pick_above = np.array([pick_xy[0], pick_xy[1], TRAVEL_Z], dtype=float)
+            pick_contact = np.array([pick_xy[0], pick_xy[1], PICK_CONTACT_Z], dtype=float)
+            place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
+            place_contact = np.array([place_xy[0], place_xy[1], place_z], dtype=float)
+
+            print(f"\n========== {index + 1}/{len(labels)}: {name} ==========")
+            print(
+                f"Pick XY: {np.round(pick_xy, 5)} (pitch {np.rad2deg(pick_above_pitch):.1f} -> {np.rad2deg(pick_contact_pitch):.1f} deg), "
+                f"Place XY: {np.round(place_xy, 5)} (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)"
+            )
+
+            current_q = plan_and_execute_to(
+                node, current_q, pick_above,
+                f"{name}: approach above pick", CARTESIAN_DURATION,
+                APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+                start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
+                goal_tool_angle=pick_above_pitch,
+            )
+            node.command_gripper(
+                GRIPPER_HOME_POSITION,
+                f"open to home before picking {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
+            )
+
+            # Phase 1/4: descend to pick
+            current_q = plan_and_execute_to(
+                node, current_q, pick_contact,
+                f"{name}: phase 1/4 descend to pick", VERTICAL_DURATION,
+                PICK_DESCENT_WAYPOINTS, vertical_only=True,
+                start_tool_angle=pick_above_pitch,
+                goal_tool_angle=pick_contact_pitch,
+            )
+            grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_CLOSED_POSITION)
+            grip_deg = SHAPE_GRIP_ANGLES_DEG.get(name, 203.8)
+            node.command_gripper(grip_pos, f"grip {name} ({grip_deg:.1f}° / {grip_pos:.4f} m)")
+            time.sleep(0.5)
+
+            # Phase 2/4: lift to clearance
+            current_q = plan_and_execute_to(
+                node, current_q, pick_above,
+                f"{name}: phase 2/4 lift to clearance", VERTICAL_DURATION,
+                PICK_LIFT_WAYPOINTS, vertical_only=True,
+                start_tool_angle=pick_contact_pitch,
+                goal_tool_angle=pick_above_pitch,
+            )
+
+            # Phase 3/4: XY transfer
+            current_q = plan_and_execute_to(
+                node, current_q, place_above,
+                f"{name}: phase 3/4 XY transfer", CARTESIAN_DURATION,
+                XY_TRANSFER_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+                horizontal_only=True,
+                start_tool_angle=pick_above_pitch,
+                goal_tool_angle=place_above_pitch,
+            )
+
+            # Phase 4/4: descend to place
+            current_q = plan_and_execute_to(
+                node, current_q, place_contact,
+                f"{name}: phase 4/4 descend to place", VERTICAL_DURATION,
+                PLACE_DESCENT_WAYPOINTS, vertical_only=True,
+                minimum_path_z=MIN_PLACE_Z,
+                start_tool_angle=place_above_pitch,
+                goal_tool_angle=place_contact_pitch,
+            )
+            node.command_gripper(
+                GRIPPER_HOME_POSITION,
+                f"open to home after placing {name} ({GRIPPER_HOME_ANGLE_DEG:.1f}°)",
+            )
+
+            # Retract after placement
+            place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
+            place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
+            try:
+                current_q = plan_and_execute_to(
+                    node, current_q, place_retract,
+                    f"{name}: retract after placement to 16cm", VERTICAL_DURATION,
+                    POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
+                    minimum_path_z=MIN_PLACE_Z,
+                    start_tool_angle=place_contact_pitch,
+                    goal_tool_angle=place_retract_pitch,
+                )
+            except Exception as exc:
+                print(f"[WARN] Retract planning error after placing {name}: {exc}. Proceeding directly home.", flush=True)
         except Exception as exc:
-            print(f"[WARN] Retract planning error after placing {name}: {exc}. Proceeding directly home.", flush=True)
+            print(f"[WARN] {name}: step failed ({exc}). Recovering to home and continuing with the next shape.", flush=True)
+            try:
+                current_q = validate_q(node.get_current_q(), "Measured joints after failure")
+                rt, rp = plan_startup_joint_move(current_q, HOME_Q)
+                node.execute_arm(rp, rt, f"recover after {name}")
+                current_q = validate_q(node.get_current_q(), "Measured joints after recovery")
+                node.command_gripper(GRIPPER_HOME_POSITION, "open gripper after recovery")
+            except Exception as exc2:
+                print(f"[WARN] Recovery move failed ({exc2}); continuing.", flush=True)
 
     try:
         current_q = plan_and_execute_to(

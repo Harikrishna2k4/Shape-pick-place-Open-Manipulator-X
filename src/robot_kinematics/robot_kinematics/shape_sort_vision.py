@@ -207,11 +207,14 @@ CIRCLE_PLACE_OFFSET_Y_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_Y", "0.030")
 PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.010"))     #  +1.0 cm (farther from base)
 PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))     #  0.0 cm
 
+# Extra +X (farther from base) place offset for hexagon and square: +2.0 cm
+SQUARE_HEX_PLACE_EXTRA_X_M = float(os.environ.get("SHAPE_SORT_SQUARE_HEX_PLACE_X", "0.020"))
+
 # Per-shape placing offsets [dX, dY] (metres):
 PER_SHAPE_PLACE_OFFSETS = {
     "green_circle":    np.array([PLACE_OFFSET_X_M + CIRCLE_PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M + CIRCLE_PLACE_OFFSET_Y_M], dtype=np.float64),
-    "orange_hexagon":  np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
-    "blue_square":     np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
+    "orange_hexagon":  np.array([PLACE_OFFSET_X_M + SQUARE_HEX_PLACE_EXTRA_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
+    "blue_square":     np.array([PLACE_OFFSET_X_M + SQUARE_HEX_PLACE_EXTRA_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
     "yellow_triangle": np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
 }
 
@@ -2594,6 +2597,25 @@ def main():
                 return NO_COLOURED_OBJECTS_EXIT
             print("VISION ERROR: no stable matching pairs passed validation.", flush=True)
             return 1
+
+        # Calculate transfer length (distance between pick and place) for each shape
+        # and order shapes so the closest to its destination is picked first
+        pair_lengths = [
+            float(np.linalg.norm(np.asarray(t[1]) - np.asarray(t[0])))
+            for t in targets
+        ]
+        sort_indices = np.argsort(pair_lengths)
+
+        labels = [labels[i] for i in sort_indices]
+        targets = [targets[i] for i in sort_indices]
+        pick_pixels = [pick_pixels[i] for i in sort_indices]
+        place_pixels = [place_pixels[i] for i in sort_indices]
+        sample_counts = [sample_counts[i] for i in sort_indices]
+        sorted_lengths = [pair_lengths[i] for i in sort_indices]
+
+        print("\n[ORDER] Shape sorting sequence ordered by increasing transfer length (closest first):", flush=True)
+        for rank, (name, length) in enumerate(zip(labels, sorted_lengths), start=1):
+            print(f"  {rank}. {name:16s}: transfer length = {length * 1000:6.1f} mm ({length * 100:4.1f} cm)", flush=True)
 
         write_targets(paths, labels, np.asarray(targets, dtype=np.float64),
                       pick_pixels, place_pixels, sample_counts)

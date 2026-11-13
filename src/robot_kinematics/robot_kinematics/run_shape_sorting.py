@@ -54,12 +54,13 @@ def validate_targets_file(path):
     if not np.all(np.isfinite(targets)):
         raise ValueError("Vision output contains non-finite robot coordinates.")
 
-    print(f"Validated {len(labels)} pick/place pair(s):", flush=True)
-    for label, pair in zip(labels, targets):
+    print(f"Validated {len(labels)} pick/place pair(s) (ordered by increasing transfer length):", flush=True)
+    for index, (label, pair) in enumerate(zip(labels, targets), start=1):
         pick_xy, place_xy = pair
+        dist = float(np.linalg.norm(place_xy - pick_xy))
         print(
-            f"  {label}: PICK=({pick_xy[0]:.5f}, {pick_xy[1]:.5f}) m | "
-            f"PLACE=({place_xy[0]:.5f}, {place_xy[1]:.5f}) m",
+            f"  {index}. {label:16s}: length = {dist * 1000:6.1f} mm ({dist * 100:4.1f} cm) | "
+            f"PICK=({pick_xy[0]:.5f}, {pick_xy[1]:.5f}) m -> PLACE=({place_xy[0]:.5f}, {place_xy[1]:.5f}) m",
             flush=True,
         )
 
