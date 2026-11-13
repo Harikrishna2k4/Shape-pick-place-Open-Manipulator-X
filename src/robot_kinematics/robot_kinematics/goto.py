@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Move OpenMANIPULATOR-X to HOME_XYZ position from its current pose."""
 
+import os
 import sys
 import time
 import numpy as np
@@ -41,9 +42,15 @@ JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4"]
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 TARGET_Q = np.array([-0.13346, -1.29315, 0.04142, 2.02485], dtype=float)
 
-# Gripper motor target position (raw interface units for motor dxl5: -0.92 = open)
-TARGET_GRIPPER_POSITION = -0.92
+# Gripper target position in metres:
+# Physical mapping observed on hardware:
+#   Open gripper:   +0.010 m
+#   Closed gripper: -0.00944 m
+TARGET_GRIPPER_POSITION = float(os.environ.get("GRIPPER_OPEN_POS", "0.010"))
 GRIPPER_MAX_EFFORT = 20.0
+
+def dxl5_to_prismatic(dxl5_rad: float) -> float:
+    return float(dxl5_rad)
 
 # ROS communication endpoints
 JOINT_STATE_TOPIC = "/joint_states"
@@ -154,6 +161,11 @@ class GotoHomeNode(Node):
         if not self.torque_client.wait_for_service(timeout_sec=3.0):
             self.get_logger().warn(f"Torque service '{TORQUE_SERVICE}' not available; proceeding...")
         else:
+            # Force torque cycle (OFF then ON) to un-stale driver state and guarantee hardware latching
+            req_off = SetBool.Request(data=False)
+            f_off = self.torque_client.call_async(req_off)
+            rclpy.spin_until_future_complete(self, f_off, timeout_sec=2.0)
+
             request = SetBool.Request(data=True)
             future = self.torque_client.call_async(request)
             rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
@@ -164,18 +176,29 @@ class GotoHomeNode(Node):
                 else:
                     self.get_logger().warn(f"Torque enable returned false: {res.message}")
 
-        # Explicitly ensure gripper Dynamixel (ID 15) torque is enabled if service available
+        # Explicitly ensure arm Dynamixels (IDs 11, 12, 13, 14) have Torque Enable = 1
         if self.dxl_data_client is not None and self.dxl_data_client.wait_for_service(timeout_sec=3.0):
+            for dxl_id in (11, 12, 13, 14):
+                req = SetDataToDxl.Request()
+                req.id = dxl_id
+                req.item_name = "Torque Enable"
+                req.item_data = 1
+                future = self.dxl_data_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+                if future.done() and future.result() is not None and future.result().result:
+                    self.get_logger().info(f"Dynamixel ID {dxl_id} torque explicitly enabled.")
+                else:
+                    self.get_logger().warn(f"Failed to explicitly enable Dynamixel ID {dxl_id} torque.")
+
+            # Gripper motor (ID 15): enable torque unless explicitly disabled
+            enable_grip = os.environ.get("ENABLE_GRIPPER_TORQUE", "1") != "0"
             req = SetDataToDxl.Request()
             req.id = 15
             req.item_name = "Torque Enable"
-            req.item_data = 1
+            req.item_data = 1 if enable_grip else 0
             future = self.dxl_data_client.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
-            if future.done() and future.result() is not None and future.result().result:
-                self.get_logger().info("Gripper Dynamixel (ID 15) torque explicitly enabled.")
-            else:
-                self.get_logger().warn("Failed to explicitly enable gripper Dynamixel ID 15 torque.")
+            rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+            self.get_logger().info(f"Gripper Dynamixel (ID 15) torque set to {req.item_data}.")
 
     def get_current_joints(self, timeout_sec: float = 10.0) -> np.ndarray:
         """Wait for and return fresh measured joint angles from /joint_states."""
@@ -195,11 +218,11 @@ class GotoHomeNode(Node):
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = JOINT_NAMES
 
-        for t, q, qd, qdd in zip(times, positions, velocities, accelerations):
+        for t, q, qd in zip(times, positions, velocities):
             point = JointTrajectoryPoint()
             point.positions = [float(v) for v in q]
             point.velocities = [float(v) for v in qd]
-            point.accelerations = [float(v) for v in qdd]
+            # Match openmanipulator_fixed_orientation_pick_and_place: omit accelerations
             point.time_from_start = make_duration(float(t))
             goal.trajectory.points.append(point)
 
@@ -225,6 +248,10 @@ class GotoHomeNode(Node):
 
     def command_gripper(self, position: float, label: str = "gripper", timeout_sec: float = 10.0):
         """Send target position to the GripperCommand action server and wait for completion."""
+        if os.environ.get("ENABLE_GRIPPER_TORQUE", "1") == "0":
+            self.get_logger().info(f"Gripper torque disabled: skipping command for {label}.")
+            return
+
         self.get_logger().info(f"Waiting for gripper action server: {GRIPPER_ACTION}")
         if not self.gripper_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(f"Gripper action server unavailable: {GRIPPER_ACTION}")
@@ -295,13 +322,14 @@ def main():
         # 4. Execute trajectory immediately
         node.execute_trajectory(times, positions, velocities, accelerations)
 
-        # 5. Command gripper joint (motor dxl5) to target position (-0.92 = open)
-        print(f"\nMoving gripper motor (dxl5) to {TARGET_GRIPPER_POSITION:+.5f} (open)...")
+        # 5. Command gripper joint to open target position (-0.00944 m = open)
+        print(f"\nMoving gripper to open position ({TARGET_GRIPPER_POSITION:+.5f} m)...")
         node.command_gripper(TARGET_GRIPPER_POSITION, label="open gripper")
 
         # 6. Confirm final position
         final_q = node.get_current_joints()
         final_xyz, _, _ = forward_kinematics(*final_q)
+        max_error = float(np.max(np.abs(final_q - TARGET_Q)))
         print("\nReached Target Position:")
         print(f"Final Joints:           {np.round(final_q, 5)} rad")
         if node.current_dxl5 is not None:
@@ -311,6 +339,15 @@ def main():
         print(f"Final XYZ:              {np.round(final_xyz, 5)} m")
         print(f"Joint Error:            {np.round(np.abs(final_q - TARGET_Q), 5)} rad")
         print("=" * 60)
+
+        if max_error > 0.05:
+            print(f"\n[WARNING] Robot did not reach target pose! Max joint error: {max_error:.4f} rad.")
+            print("[CHECK] If the physical arm did not move at all, verify:")
+            print("  1. Physical 12V DC power cable to OpenMANIPULATOR-X is plugged in and switch is ON.")
+            print("  2. Dynamixel U2D2 / USB interface cable connection.")
+            return 1
+
+        print("Motion completed successfully.")
         return 0
 
     except Exception as exc:
