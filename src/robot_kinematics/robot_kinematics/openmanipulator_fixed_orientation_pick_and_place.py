@@ -75,17 +75,17 @@ def normalize_z(val, default=0.080):
         return float(default)
 
 
-PICK_CONTACT_Z = normalize_z(os.environ.get("PICK_CONTACT_Z", "0.060"), 0.060)   # Lowest pick contact height (0.060 m = 6 cm)
+PICK_CONTACT_Z = normalize_z(os.environ.get("PICK_CONTACT_Z", "0.070"), 0.070)   # Lowest pick contact height (0.070 m = 7 cm)
 
-# Hard safety floor: arm/TCP must NEVER descend below 0.080 m (80 mm) for any shape at any point.
-MIN_PLACE_Z = normalize_z(os.environ.get("MIN_PLACE_Z", "0.080"), 0.080)         # Hard minimum placing floor (0.080 m)
+# Hard safety floor: arm/TCP must NEVER descend below 0.070 m (70 mm) for any shape during placing.
+MIN_PLACE_Z = normalize_z(os.environ.get("MIN_PLACE_Z", "0.070"), 0.070)         # Hard minimum placing floor (0.070 m)
 
-# Lowest point for vertical descent during placing: 0.080 m (80 mm)
+# Lowest point for vertical descent during placing: 0.070 m (70 mm)
 DEFAULT_PLACE_CONTACT_Z = max(
-    normalize_z(os.environ.get("PLACE_CONTACT_Z", "0.080"), 0.080),
+    normalize_z(os.environ.get("PLACE_CONTACT_Z", "0.070"), 0.070),
     MIN_PLACE_Z,
 )
-PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                                        # Default place contact height (0.080 m)
+PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                                        # Default place contact height (0.070 m)
 
 # Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z)
 PER_SHAPE_PLACE_Z = {
@@ -97,20 +97,20 @@ PER_SHAPE_PLACE_Z = {
 
 
 def get_shape_place_contact_z(shape_name):
-    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z (0.080 m)."""
+    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z (0.070 m)."""
     z_val = PER_SHAPE_PLACE_Z.get(shape_name, DEFAULT_PLACE_CONTACT_Z)
     return max(float(z_val), MIN_PLACE_Z)
 
 
-TRAVEL_Z = 0.140                                                    # 14 cm clearance plane ensures far holes are within kinematic reach
-PLACE_RETRACT_Z = 0.160                                             # 16 cm vertical retract after placing
-MIN_TRANSFER_Z = 0.120                                              # Hard floor for non-contact travel.
+TRAVEL_Z = normalize_z(os.environ.get("TRAVEL_Z", "0.170"), 0.170)                  # 17 cm clearance plane above pick and place
+PLACE_RETRACT_Z = normalize_z(os.environ.get("PLACE_RETRACT_Z", "0.170"), 0.170)    # 17 cm vertical retract after placing
+MIN_TRANSFER_Z = normalize_z(os.environ.get("MIN_TRANSFER_Z", "0.170"), 0.170)      # Hard floor for non-contact travel (17 cm)
 
 # Four main phases. Counts include both endpoints of each individual phase.
-# Since adjoining phases share their common endpoint, the unique count is 15.
+# Since adjoining phases share their common endpoint, the unique count is 17.
 PICK_DESCENT_WAYPOINTS = 5
 PICK_LIFT_WAYPOINTS = 4
-XY_TRANSFER_WAYPOINTS = 4
+XY_TRANSFER_WAYPOINTS = 6
 PLACE_DESCENT_WAYPOINTS = 5
 MAIN_UNIQUE_WAYPOINT_COUNT = (
     PICK_DESCENT_WAYPOINTS
@@ -118,7 +118,7 @@ MAIN_UNIQUE_WAYPOINT_COUNT = (
     + (XY_TRANSFER_WAYPOINTS - 1)
     + (PLACE_DESCENT_WAYPOINTS - 1)
 )
-MAX_MAIN_UNIQUE_WAYPOINTS = 15
+MAX_MAIN_UNIQUE_WAYPOINTS = 20
 
 # Approach/retract/return paths are separate from the 15-point four-phase path.
 APPROACH_WAYPOINTS = 9
@@ -159,6 +159,14 @@ SHAPE_GRIP_ANGLES_DEG = {
     "blue_square":     float(os.environ.get("GRIP_DEG_BLUE_SQUARE", "184.6")),
     "orange_hexagon":  float(os.environ.get("GRIP_DEG_ORANGE_HEXAGON", "193.0")),
     "yellow_triangle": float(os.environ.get("GRIP_DEG_YELLOW_TRIANGLE", "203.8")),
+}
+
+# Per-shape grip width adjustments (+0.003 m closes 3 mm tighter / narrower grip width)
+SHAPE_GRIP_WIDTH_OFFSET_M = {
+    "green_circle":    float(os.environ.get("GRIP_WIDTH_ADJ_GREEN_CIRCLE", "0.003")),   # 3mm tighter
+    "blue_square":     float(os.environ.get("GRIP_WIDTH_ADJ_BLUE_SQUARE", "0.000")),
+    "orange_hexagon":  float(os.environ.get("GRIP_WIDTH_ADJ_ORANGE_HEXAGON", "0.000")),
+    "yellow_triangle": float(os.environ.get("GRIP_WIDTH_ADJ_YELLOW_TRIANGLE", "0.003")), # 3mm tighter
 }
 
 def angle_deg_to_prismatic(deg: float) -> float:
@@ -202,7 +210,7 @@ def prismatic_to_dxl5(prismatic_m: float) -> float:
     return float(prismatic_m)
 
 GRIP_POSITIONS_BY_SHAPE = {
-    shape: angle_deg_to_prismatic(deg)
+    shape: min(0.019, angle_deg_to_prismatic(deg) + SHAPE_GRIP_WIDTH_OFFSET_M.get(shape, 0.0))
     for shape, deg in SHAPE_GRIP_ANGLES_DEG.items()
 }
 
@@ -689,8 +697,18 @@ def plan_cartesian_segment(
             f"[{label}] Active prevention: spline sag of {sag*1000:.2f} mm detected "
             f"(min Z={min_actual_z:.4f} m < {allowed_min_z:.4f} m). Elevating waypoints..."
         )
-        progress = np.linspace(0.0, 1.0, len(cartesian_waypoints))
-        cartesian_waypoints[:, 2] += (sag + 0.0005) * progress
+        if horizontal_only or (start_xyz[2] >= allowed_min_z - 1e-4 and goal_xyz[2] >= allowed_min_z - 1e-4):
+            # Both endpoints are at or above floor: elevate the sagging interior with a sine bell curve
+            # so endpoints stay anchored at their exact target heights without being pushed into unreachable space.
+            elevation_profile = np.sin(np.pi * np.linspace(0.0, 1.0, len(cartesian_waypoints)))
+        elif start_xyz[2] > goal_xyz[2]:
+            # Descending motion towards floor: elevate towards goal endpoint
+            elevation_profile = np.linspace(0.0, 1.0, len(cartesian_waypoints))
+        else:
+            # Ascending motion departing floor: elevate towards start endpoint
+            elevation_profile = np.linspace(1.0, 0.0, len(cartesian_waypoints))
+
+        cartesian_waypoints[:, 2] += (sag + 0.0005) * elevation_profile
     else:
         duration = current_dur
 
@@ -1093,10 +1111,11 @@ def preflight_entire_sequence(targets, labels, start_q):
         place_above = np.array([place_xy[0], place_xy[1], TRAVEL_Z], dtype=float)
         place_contact = np.array([place_xy[0], place_xy[1], place_z], dtype=float)
 
-        print(f"\n[PRE-FLIGHT] {name}: approach to pick height (pitch={np.rad2deg(pick_above_pitch):.1f} deg)")
+        approach_min_z = min(float(fk(simulated_q)[0][2]), MIN_TRANSFER_Z)
+        print(f"\n[PRE-FLIGHT] {name}: approach to pick height (pitch={np.rad2deg(pick_above_pitch):.1f} deg, min_z={approach_min_z:.3f} m)")
         simulated_q = preflight_plan_segment(
             simulated_q, pick_above, f"{name} approach to pick", CARTESIAN_DURATION,
-            APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+            APPROACH_WAYPOINTS, minimum_path_z=approach_min_z,
             start_tool_angle=float(simulated_q[1] + simulated_q[2] + simulated_q[3]),
             goal_tool_angle=pick_above_pitch,
         )
@@ -1137,7 +1156,7 @@ def preflight_entire_sequence(targets, labels, start_q):
 
         place_retract_pitch = find_feasible_pitch_at_z(place_xy, PLACE_RETRACT_Z, preferred=place_above_pitch)
         place_retract = np.array([place_xy[0], place_xy[1], PLACE_RETRACT_Z], dtype=float)
-        print(f"[PRE-FLIGHT] {name}: retract after release to 16cm (pitch {np.rad2deg(place_contact_pitch):.1f} -> {np.rad2deg(place_retract_pitch):.1f} deg)")
+        print(f"[PRE-FLIGHT] {name}: retract after release to {PLACE_RETRACT_Z*100:.0f}cm (pitch {np.rad2deg(place_contact_pitch):.1f} -> {np.rad2deg(place_retract_pitch):.1f} deg)")
         simulated_q = preflight_plan_segment(
             simulated_q, place_retract, f"{name} post-place retract", VERTICAL_DURATION,
             POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
@@ -1148,9 +1167,10 @@ def preflight_entire_sequence(targets, labels, start_q):
         print(f"[PRE-FLIGHT] {name}: all paths passed.")
 
     print("\n[PRE-FLIGHT] Return to home TCP")
+    home_min_z = min(float(HOME_XYZ[2]), 0.160)
     simulated_q = preflight_plan_segment(
         simulated_q, HOME_XYZ, "return to HOME XYZ", CARTESIAN_DURATION,
-        RETURN_HOME_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+        RETURN_HOME_WAYPOINTS, minimum_path_z=home_min_z,
         start_tool_angle=float(simulated_q[1] + simulated_q[2] + simulated_q[3]),
         goal_tool_angle=TASK_TOOL_ANGLE,
     )
@@ -1303,10 +1323,11 @@ def run_sequence(node):
                 f"Place XY: {np.round(place_xy, 5)} (pitch {np.rad2deg(place_above_pitch):.1f} -> {np.rad2deg(place_contact_pitch):.1f} deg)"
             )
 
+            approach_min_z = min(float(fk(current_q)[0][2]), MIN_TRANSFER_Z)
             current_q = plan_and_execute_to(
                 node, current_q, pick_above,
                 f"{name}: approach above pick", CARTESIAN_DURATION,
-                APPROACH_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+                APPROACH_WAYPOINTS, minimum_path_z=approach_min_z,
                 start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
                 goal_tool_angle=pick_above_pitch,
             )
@@ -1324,7 +1345,7 @@ def run_sequence(node):
                 goal_tool_angle=pick_contact_pitch,
             )
             grip_pos = GRIP_POSITIONS_BY_SHAPE.get(name, GRIPPER_CLOSED_POSITION)
-            grip_deg = SHAPE_GRIP_ANGLES_DEG.get(name, 203.8)
+            grip_deg = prismatic_to_angle_deg(grip_pos)
             node.command_gripper(grip_pos, f"grip {name} ({grip_deg:.1f}° / {grip_pos:.4f} m)")
             time.sleep(0.5)
 
@@ -1367,7 +1388,7 @@ def run_sequence(node):
             try:
                 current_q = plan_and_execute_to(
                     node, current_q, place_retract,
-                    f"{name}: retract after placement to 16cm", VERTICAL_DURATION,
+                    f"{name}: retract after placement to {PLACE_RETRACT_Z*100:.0f}cm", VERTICAL_DURATION,
                     POST_PLACE_RETRACT_WAYPOINTS, vertical_only=True,
                     minimum_path_z=MIN_PLACE_Z,
                     start_tool_angle=place_contact_pitch,
@@ -1387,10 +1408,11 @@ def run_sequence(node):
                 print(f"[WARN] Recovery move failed ({exc2}); continuing.", flush=True)
 
     try:
+        home_min_z = min(float(HOME_XYZ[2]), 0.160)
         current_q = plan_and_execute_to(
             node, current_q, HOME_XYZ,
             "return to HOME XYZ at working pitch", CARTESIAN_DURATION,
-            RETURN_HOME_WAYPOINTS, minimum_path_z=MIN_TRANSFER_Z,
+            RETURN_HOME_WAYPOINTS, minimum_path_z=home_min_z,
             start_tool_angle=float(current_q[1] + current_q[2] + current_q[3]),
             goal_tool_angle=TASK_TOOL_ANGLE,
         )
