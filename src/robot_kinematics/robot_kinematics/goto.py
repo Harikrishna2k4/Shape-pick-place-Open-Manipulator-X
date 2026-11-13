@@ -176,29 +176,16 @@ class GotoHomeNode(Node):
                 else:
                     self.get_logger().warn(f"Torque enable returned false: {res.message}")
 
-        # Explicitly ensure arm Dynamixels (IDs 11, 12, 13, 14) have Torque Enable = 1
-        if self.dxl_data_client is not None and self.dxl_data_client.wait_for_service(timeout_sec=3.0):
-            for dxl_id in (11, 12, 13, 14):
-                req = SetDataToDxl.Request()
-                req.id = dxl_id
-                req.item_name = "Torque Enable"
-                req.item_data = 1
-                future = self.dxl_data_client.call_async(req)
-                rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
-                if future.done() and future.result() is not None and future.result().result:
-                    self.get_logger().info(f"Dynamixel ID {dxl_id} torque explicitly enabled.")
-                else:
-                    self.get_logger().warn(f"Failed to explicitly enable Dynamixel ID {dxl_id} torque.")
-
-            # Gripper motor (ID 15): enable torque unless explicitly disabled
-            enable_grip = os.environ.get("ENABLE_GRIPPER_TORQUE", "1") != "0"
+        # Optional override for gripper motor (ID 15) if explicitly disabled via env
+        enable_grip = os.environ.get("ENABLE_GRIPPER_TORQUE", "1") != "0"
+        if not enable_grip and self.dxl_data_client is not None and self.dxl_data_client.wait_for_service(timeout_sec=2.0):
             req = SetDataToDxl.Request()
             req.id = 15
             req.item_name = "Torque Enable"
-            req.item_data = 1 if enable_grip else 0
+            req.item_data = 0
             future = self.dxl_data_client.call_async(req)
             rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
-            self.get_logger().info(f"Gripper Dynamixel (ID 15) torque set to {req.item_data}.")
+            self.get_logger().info("Gripper Dynamixel (ID 15) torque explicitly disabled.")
 
     def get_current_joints(self, timeout_sec: float = 10.0) -> np.ndarray:
         """Wait for and return fresh measured joint angles from /joint_states."""
