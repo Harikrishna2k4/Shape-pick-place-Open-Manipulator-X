@@ -62,17 +62,32 @@ TASK_TOOL_ANGLE = float(np.deg2rad(45.0))
 # TCP position recorded for POSE SAMPLE 17 (metres).
 HOME_XYZ = np.array([0.02445, -0.00167, 0.16441], dtype=float)
 
-PICK_CONTACT_Z = float(os.environ.get("PICK_CONTACT_Z", "0.060"))   # Lowest pick contact height (0.060 m = 6 cm)
+def normalize_z(val, default=0.080):
+    """Normalize input Z to metres, safely handling mm (e.g. 80.0) or typo decimetres (e.g. 0.8m -> 0.08m)."""
+    try:
+        f = float(val)
+        if f >= 10.0:  # e.g., 80.0 mm -> 0.080 m
+            return f / 1000.0
+        elif f >= 0.5:  # e.g., 0.8 m -> 0.080 m (protect against user typo for 0.08m)
+            return f / 10.0
+        return f
+    except (ValueError, TypeError):
+        return float(default)
 
-# Hard safety floor: arm/TCP must NEVER descend below 0.078 m (78 mm) for any shape at any point.
-MIN_PLACE_Z = float(os.environ.get("MIN_PLACE_Z", "0.078"))         # Hard minimum placing floor (0.078 m)
 
-# Target placing contact height (m): set to 0.082 m (4 mm clearance above floor) to prevent
-# any mechanical compliance or dynamics from touching or crossing the 0.078 m floor.
-DEFAULT_PLACE_CONTACT_Z = max(float(os.environ.get("PLACE_CONTACT_Z", "0.082")), MIN_PLACE_Z + 0.002)
-PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                            # Default place contact height (0.082 m)
+PICK_CONTACT_Z = normalize_z(os.environ.get("PICK_CONTACT_Z", "0.060"), 0.060)   # Lowest pick contact height (0.060 m = 6 cm)
 
-# Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z + 0.002)
+# Hard safety floor: arm/TCP must NEVER descend below 0.080 m (80 mm) for any shape at any point.
+MIN_PLACE_Z = normalize_z(os.environ.get("MIN_PLACE_Z", "0.080"), 0.080)         # Hard minimum placing floor (0.080 m)
+
+# Lowest point for vertical descent during placing: 0.080 m (80 mm)
+DEFAULT_PLACE_CONTACT_Z = max(
+    normalize_z(os.environ.get("PLACE_CONTACT_Z", "0.080"), 0.080),
+    MIN_PLACE_Z,
+)
+PLACE_CONTACT_Z = DEFAULT_PLACE_CONTACT_Z                                        # Default place contact height (0.080 m)
+
+# Optional per-shape place contact heights (all strictly clamped >= MIN_PLACE_Z)
 PER_SHAPE_PLACE_Z = {
     "green_circle":    DEFAULT_PLACE_CONTACT_Z,
     "orange_hexagon":  DEFAULT_PLACE_CONTACT_Z,
@@ -82,9 +97,9 @@ PER_SHAPE_PLACE_Z = {
 
 
 def get_shape_place_contact_z(shape_name):
-    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z + 0.002 m."""
+    """Return the place contact height for a shape, strictly enforced >= MIN_PLACE_Z (0.080 m)."""
     z_val = PER_SHAPE_PLACE_Z.get(shape_name, DEFAULT_PLACE_CONTACT_Z)
-    return max(float(z_val), MIN_PLACE_Z + 0.002)
+    return max(float(z_val), MIN_PLACE_Z)
 
 
 TRAVEL_Z = 0.140                                                    # 14 cm clearance plane ensures far holes are within kinematic reach

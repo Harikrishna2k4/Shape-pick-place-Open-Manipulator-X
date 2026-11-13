@@ -201,8 +201,8 @@ BOTTOM_SHAPES_PLACE_OFFSET_Y_M = float(
 
 # Per-shape specific placing offsets:
 # Circle placing offset in cardboard (+3 cm Y offset):
-CIRCLE_PLACE_OFFSET_X_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_X", "0.000"))
-CIRCLE_PLACE_OFFSET_Y_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_Y", "0.030"))   # +3.0 cm (0.030 m)
+CIRCLE_PLACE_OFFSET_X_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_X", "0.010"))   # +1.0 cm
+CIRCLE_PLACE_OFFSET_Y_M = float(os.environ.get("CIRCLE_PLACE_OFFSET_Y", "0.020"))   # +2.0 cm (was +3.0, reduced by 1.0)
 
 PICK_OFFSET_X_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_X", "0.010"))     #  +1.0 cm (farther from base)
 PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))     #  0.0 cm
@@ -210,10 +210,14 @@ PICK_OFFSET_Y_M = float(os.environ.get("SHAPE_SORT_PICK_OFFSET_Y", "0.000"))    
 # Extra +X (farther from base) place offset for hexagon and square: +2.0 cm
 SQUARE_HEX_PLACE_EXTRA_X_M = float(os.environ.get("SHAPE_SORT_SQUARE_HEX_PLACE_X", "0.020"))
 
+# Extra hexagon place offset on top of the shared +2 cm X: -1.0 cm X, +1.0 cm Y (net +1.0 cm X, +1.0 cm Y)
+HEXAGON_PLACE_EXTRA_X_M = float(os.environ.get("HEXAGON_PLACE_EXTRA_X", "-0.010"))
+HEXAGON_PLACE_EXTRA_Y_M = float(os.environ.get("HEXAGON_PLACE_EXTRA_Y", "0.010"))
+
 # Per-shape placing offsets [dX, dY] (metres):
 PER_SHAPE_PLACE_OFFSETS = {
     "green_circle":    np.array([PLACE_OFFSET_X_M + CIRCLE_PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M + CIRCLE_PLACE_OFFSET_Y_M], dtype=np.float64),
-    "orange_hexagon":  np.array([PLACE_OFFSET_X_M + SQUARE_HEX_PLACE_EXTRA_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M], dtype=np.float64),
+    "orange_hexagon":  np.array([PLACE_OFFSET_X_M + SQUARE_HEX_PLACE_EXTRA_X_M + HEXAGON_PLACE_EXTRA_X_M, PLACE_OFFSET_Y_M + BOTTOM_SHAPES_PLACE_OFFSET_Y_M + HEXAGON_PLACE_EXTRA_Y_M], dtype=np.float64),
     "blue_square":     np.array([PLACE_OFFSET_X_M + SQUARE_HEX_PLACE_EXTRA_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
     "yellow_triangle": np.array([PLACE_OFFSET_X_M, PLACE_OFFSET_Y_M], dtype=np.float64),
 }
