@@ -1,3 +1,8 @@
+GROUP - 7
+Hari Krishna R - 25510046
+Gaurav Srivastava - 23110113
+Ashish Kumar Pant - 25320013
+
 We choose Task 1.
 We implemented pick and place of various shapes from random positions to the desired hole on the cardboard. 
 
